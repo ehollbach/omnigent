@@ -4612,3 +4612,108 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_on_acp_session_forwards_and_persists_env() -> None:
+    """ACP sessions forward live switches to the harness and keep them for future spawns."""
+    from fastapi.testclient import TestClient
+
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses.process_manager import NoLiveHarnessError
+
+    acp_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={
+                "harness": "acp:cline",
+                "acp_agent": {"name": "Cline", "command": "cline --acp"},
+            },
+        ),
+    )
+    app, pm = await _build_app_for_spec(acp_spec)
+
+    # Mock the harness client so POST /events echoes the settled permission mode JSON.
+    forwarded_events: list[dict[str, Any]] = []
+
+    async def _post_with_json(url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        del url, timeout
+        forwarded_events.append(json)
+
+        class _JsonResp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            content = b'{"permission_mode":"bypassPermissions"}'
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"permission_mode": json["permission_mode"]}
+
+        return _JsonResp()
+
+    pm._client.post = _post_with_json  # type: ignore[method-assign]
+    sid = "7a11223344556677889900aabbccddee"
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": sid,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                "surface_labels": {"omnigent.acp.permission_mode": "bypassPermissions"},
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # Live harness present -> forwards to harness and echoes settled JSON.
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"permission_mode": "auto"}
+        assert forwarded_events == [{"type": "permission_mode_change", "permission_mode": "auto"}]
+
+        # No live harness subprocess yet -> caches for next spawn and still confirms 200 JSON.
+        async def _no_live(*args: Any, **kwargs: Any) -> Any:
+            raise NoLiveHarnessError("no subprocess yet")
+
+        pm.get_client = _no_live  # type: ignore[method-assign]
+        resp_pre = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "permission_mode_change", "permission_mode": "bypassPermissions"},
+        )
+        assert resp_pre.status_code == 200, resp_pre.text
+        assert resp_pre.json() == {"permission_mode": "bypassPermissions"}
+
+        bad_resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "permission_mode_change", "permission_mode": "plan"},
+        )
+        assert bad_resp.status_code == 400, bad_resp.text
+
+    # Also verify HarnessApp -> ExecutorAdapter -> AcpExecutor end-to-end.
+    ex = AcpExecutor(AcpAgentConfig(command="cline --acp", name="Cline", permission_mode="auto"))
+    adapter = ExecutorAdapter(lambda: ex, harness_label="Cline")
+    harness_app = adapter.build()
+    harness_app.state.conversation_id = sid
+    with TestClient(harness_app) as hclient:
+        hresp = hclient.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "permission_mode_change", "permission_mode": "bypassPermissions"},
+        )
+        assert hresp.status_code == 200, hresp.text
+        assert hresp.json() == {"permission_mode": "bypassPermissions"}
+        assert ex._permission_mode == "bypassPermissions"
+        assert ex._bypass_permissions is True
+
+        hbad = hclient.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "permission_mode_change", "permission_mode": "plan"},
+        )
+        assert hbad.status_code == 400, hbad.text

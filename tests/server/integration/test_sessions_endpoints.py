@@ -12605,6 +12605,88 @@ async def test_patch_permission_mode_rejects_non_claude_session(
     assert "permission_mode is only supported" in resp.text
 
 
+@pytest.mark.parametrize(
+    ("harness_value", "agent_cfg"),
+    [
+        ("acp:cline", {"harness": "acp:cline"}),
+        ("mirror", {"harness": "mirror"}),
+    ],
+)
+async def test_patch_permission_mode_acp_requires_runner_confirmation_and_persists_label(
+    client: httpx.AsyncClient,
+    harness_value: str,
+    agent_cfg: dict[str, Any],
+) -> None:
+    """ACP sessions confirm permission switches with the runner and persist the label."""
+    from omnigent.runtime import set_runner_client
+
+    forwarded_bodies: list[dict[str, Any]] = []
+    runner_mode = "json"
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            body = json.loads(request.content) if request.content else {}
+            forwarded_bodies.append(body)
+            if runner_mode == "legacy_204":
+                return httpx.Response(204)
+            return httpx.Response(200, json={"permission_mode": body["permission_mode"]})
+        if request.method == "POST":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(
+            client,
+            executor={"type": "omnigent", "config": agent_cfg},
+        )
+        session = await _create_session(client, agent["id"])
+
+        # Invalid mode is rejected before reaching the runner.
+        bad_resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "plan"},
+        )
+        assert bad_resp.status_code == 400, bad_resp.text
+        assert "permission_mode must be one of" in bad_resp.text
+        assert not forwarded_bodies
+
+        # An older runner returning bare 204 (without confirmation) is rejected.
+        runner_mode = "legacy_204"
+        legacy_resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "bypassPermissions"},
+        )
+        assert legacy_resp.status_code == 503, legacy_resp.text
+        assert "needs an update" in legacy_resp.text
+        snapshot_after_legacy = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert "omnigent.acp.permission_mode" not in snapshot_after_legacy["labels"]
+
+        # Confirmed 200 JSON persists the label for subsequent turns and reconnects.
+        runner_mode = "json"
+        ok_resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "bypassPermissions"},
+        )
+        assert ok_resp.status_code == 200, ok_resp.text
+        assert ok_resp.json()["labels"]["omnigent.acp.permission_mode"] == "bypassPermissions"
+
+        # Can switch cleanly back to Ask every time (``auto``).
+        back_resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        assert back_resp.status_code == 200, back_resp.text
+        assert back_resp.json()["labels"]["omnigent.acp.permission_mode"] == "auto"
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+
 async def test_patch_session_effort_forwards_only_when_value_changes(
     client: httpx.AsyncClient,
 ) -> None:

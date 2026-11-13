@@ -41,6 +41,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
+from omnigent.inner._acp_timeouts import resolve_timeout_seconds
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
@@ -181,11 +182,28 @@ def _resolve_harness_idle_timeout_s() -> float:
 _RELEASE_GRACE_S = 5.0
 
 # Timeout for the per-conversation socket file to appear after
-# uvicorn boots inside the runner. Cold-start of an external SDK
-# (Claude Code, Codex, etc.) plus uvicorn is typically 1–3s; the
-# generous cap catches genuinely-stuck spawns without waiting
-# forever.
-_SPAWN_READY_TIMEOUT_S = 30.0
+# uvicorn boots inside the runner. Cold-start of packaged external
+# harnesses/CLIs can exceed 30s; 180s bounds genuinely stuck spawns
+# while allowing slow cold initialization.
+_DEFAULT_SPAWN_READY_TIMEOUT_S = 180.0
+_SPAWN_READY_TIMEOUT_ENV = "OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S"
+_IMPORT_TIME_SPAWN_READY_TIMEOUT_S = resolve_timeout_seconds(
+    _SPAWN_READY_TIMEOUT_ENV,
+    current_global=_DEFAULT_SPAWN_READY_TIMEOUT_S,
+    import_time_global=_DEFAULT_SPAWN_READY_TIMEOUT_S,
+    default=_DEFAULT_SPAWN_READY_TIMEOUT_S,
+)
+_SPAWN_READY_TIMEOUT_S = _IMPORT_TIME_SPAWN_READY_TIMEOUT_S
+
+
+def _spawn_ready_timeout_s() -> float:
+    return resolve_timeout_seconds(
+        _SPAWN_READY_TIMEOUT_ENV,
+        current_global=_SPAWN_READY_TIMEOUT_S,
+        import_time_global=_IMPORT_TIME_SPAWN_READY_TIMEOUT_S,
+        default=_DEFAULT_SPAWN_READY_TIMEOUT_S,
+    )
+
 
 # Polling interval while waiting for the socket to appear. Short
 # enough that fast spawns return quickly; not so short that we
@@ -320,8 +338,9 @@ async def _wait_for_bind(
     :raises RuntimeError: If the subprocess exits before binding
         or the deadline elapses (after killing the subprocess).
     """
+    timeout_s = _spawn_ready_timeout_s()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _SPAWN_READY_TIMEOUT_S
+    deadline = loop.time() + timeout_s
     while True:
         if process.returncode is not None:
             # Subprocess inherits stderr so the failure message
@@ -346,7 +365,7 @@ async def _wait_for_bind(
             raise RuntimeError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} did not bind its endpoint "
-                f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
+                f"within {timeout_s:.0f}s"
             )
         await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
 
@@ -527,11 +546,12 @@ _LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
 
 
 def _acp_startup_config(env: dict[str, str] | None) -> dict[str, str]:
-    """Keep ACP command, policy, and defaults stable while switching models live."""
+    """Keep ACP command, policy, and defaults stable while switching models or permissions live."""
     return {
         key: value
         for key, value in (env or {}).items()
-        if key.startswith("HARNESS_ACP_") and key != "HARNESS_ACP_MODEL"
+        if key.startswith("HARNESS_ACP_")
+        and key not in ("HARNESS_ACP_MODEL", "HARNESS_ACP_PERMISSION_MODE")
     }
 
 

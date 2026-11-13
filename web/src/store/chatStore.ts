@@ -173,7 +173,12 @@ import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
-import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
+import {
+  ACP_PERMISSION_MODE_LABEL_KEY,
+  acpPermissionModeFromSession,
+  claudePermissionModeFromSession,
+  isAcpPermissionSession,
+} from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import {
@@ -3998,7 +4003,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     patchSet({ claudePermissionMode: mode });
     try {
       const session = await updateSession(conversationId, { claudePermissionMode: mode });
-      patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
+      const isAcp =
+        isAcpPermissionSession(session) ||
+        typeof session.labels?.[ACP_PERMISSION_MODE_LABEL_KEY] === "string";
+      patchSet({
+        claudePermissionMode: isAcp
+          ? acpPermissionModeFromSession(session)
+          : (claudePermissionModeFromSession(session) ?? ""),
+      });
     } catch (err) {
       patchSet({ claudePermissionMode: previous });
       throw err;
@@ -5049,7 +5061,10 @@ function sessionBindingPatch(
     codexPlanMode: codexPlanModeFromSession(session),
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
-      : "",
+      : isAcpPermissionSession(session) ||
+          typeof session.labels?.[ACP_PERMISSION_MODE_LABEL_KEY] === "string"
+        ? acpPermissionModeFromSession(session)
+        : "",
     codexApprovalMode: isCodexNativeSession(session)
       ? (codexApprovalModeFromSession(session) ?? "")
       : "",

@@ -22,6 +22,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -3054,3 +3055,169 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+def test_init_timeout_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Init readiness defaults to 180s and honors config and env overrides."""
+    assert acp_executor_module._INIT_TIMEOUT_SECONDS == 180.0
+    monkeypatch.delenv("HARNESS_ACP_INIT_TIMEOUT_S", raising=False)
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    assert ex._resolve_init_timeout_seconds() == 180.0
+
+    monkeypatch.setenv("HARNESS_ACP_INIT_TIMEOUT_S", "240")
+    assert ex._resolve_init_timeout_seconds() == 240.0
+
+    configured = AcpExecutor(AcpAgentConfig(command="x", name="A", init_timeout_seconds=75.0))
+    assert configured._resolve_init_timeout_seconds() == 75.0
+
+    with pytest.raises(ValueError, match="init_timeout_seconds"):
+        AcpAgentConfig(command="x", name="A", init_timeout_seconds=0.0)
+
+
+@pytest.mark.asyncio
+async def test_shared_init_deadline_spans_initialize_auth_and_session_retry() -> None:
+    """Auth retries share one overall init deadline instead of resetting per RPC."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="SlowAuth", init_timeout_seconds=1.0))
+    ex._proc = type("_Proc", (), {"returncode": None})()
+    ex._initialized = False
+    ex._session_id = None
+
+    observed_timeouts: list[tuple[str, float]] = []
+
+    async def fake_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        del params
+        observed_timeouts.append((method, timeout))
+        if method == "initialize":
+            await asyncio.sleep(0.05)
+            return {
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {},
+                    "authMethods": [{"id": "api-key"}],
+                }
+            }
+        if (
+            method == "session/new"
+            and sum(1 for m, _ in observed_timeouts if m == "session/new") == 1
+        ):
+            return {"error": {"code": -32000, "message": "auth required"}}
+        if method == "authenticate":
+            await asyncio.sleep(0.05)
+            return {"result": {}}
+        if method == "session/new":
+            return {"result": {"sessionId": "sess_ready"}}
+        raise AssertionError(f"Unexpected RPC {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[method-assign]
+    shared_deadline = asyncio.get_running_loop().time() + ex._resolve_init_timeout_seconds()
+    await ex._ensure_initialized(deadline=shared_deadline)
+    session_id = await ex._ensure_session(deadline=shared_deadline)
+    assert session_id == "sess_ready"
+
+    assert [m for m, _ in observed_timeouts] == [
+        "initialize",
+        "session/new",
+        "authenticate",
+        "session/new",
+    ]
+    # Each step receives strictly smaller remaining budget from the shared deadline.
+    assert observed_timeouts[0][1] > observed_timeouts[2][1] > observed_timeouts[3][1]
+
+    # Once the shared deadline expires before retry, remaining raises an RPC-specific TimeoutError.
+    expired = AcpExecutor(AcpAgentConfig(command="x", name="SlowAuth", init_timeout_seconds=0.04))
+    expired._proc = type("_Proc", (), {"returncode": None})()
+
+    async def slow_auth_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        del params, timeout
+        if method == "initialize":
+            return {
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {},
+                    "authMethods": [{"id": "api-key"}],
+                }
+            }
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "auth required"}}
+        if method == "authenticate":
+            await asyncio.sleep(0.06)
+            return {"result": {}}
+        return {"result": {}}
+
+    expired._rpc = slow_auth_rpc  # type: ignore[method-assign]
+    expired_deadline = asyncio.get_running_loop().time() + expired._resolve_init_timeout_seconds()
+    await expired._ensure_initialized(deadline=expired_deadline)
+    with pytest.raises(TimeoutError, match="session/new"):
+        await expired._ensure_session(deadline=expired_deadline)
+
+
+@pytest.mark.asyncio
+async def test_set_permission_mode_updates_live_executor_and_keeps_policy_guards() -> None:
+    """Switching ``auto`` <-> ``bypassPermissions`` works live without dropping policy."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="Cline", permission_mode="auto"))
+    proc = object()
+    ex._proc = proc  # type: ignore[assignment]
+    ex._session_id = "sess_live"
+
+    elicitation_calls: list[str] = []
+
+    async def fake_elicitation(tool_name: str, tool_input: dict[str, Any]) -> bool:
+        del tool_input
+        elicitation_calls.append(tool_name)
+        return False
+
+    policy_verdicts: dict[str, str] = {}
+
+    async def fake_policy(phase: str, payload: dict[str, Any]) -> object:
+        del phase
+        action = policy_verdicts.get(payload["name"])
+        return type("_Verdict", (), {"action": action})() if action else None
+
+    ex._elicitation_handler = fake_elicitation
+    ex._policy_evaluator = fake_policy  # type: ignore[assignment]
+
+    params = {"toolCall": {"toolCallId": "tc_1", "title": "write_file", "rawInput": {"path": "a"}}}
+
+    # Default 'auto' prompts via elicitation (which rejects here).
+    allowed, _ = await ex._decide_permission(params)
+    assert allowed is False
+    assert elicitation_calls == ["write_file"]
+
+    # Switch live to bypassPermissions -> keeps proc/session_id and auto-allows unguarded tools.
+    assert ex.set_permission_mode("bypassPermissions") == "bypassPermissions"
+    assert ex._proc is proc
+    assert ex._session_id == "sess_live"
+    allowed, _ = await ex._decide_permission(params)
+    assert allowed is True
+    assert elicitation_calls == ["write_file"]
+
+    # Explicit policy DENY and ASK remain enforced even in bypassPermissions.
+    policy_verdicts["write_file"] = "POLICY_ACTION_DENY"
+    allowed, _ = await ex._decide_permission(params)
+    assert allowed is False
+
+    policy_verdicts["write_file"] = "POLICY_ACTION_ASK"
+    allowed, _ = await ex._decide_permission(params)
+    assert allowed is False
+    assert elicitation_calls == ["write_file", "write_file"]
+
+    # Switching back to 'auto' restores elicitation prompts on unguarded tools.
+    policy_verdicts.clear()
+    assert ex.set_permission_mode("auto") == "auto"
+    allowed, _ = await ex._decide_permission(params)
+    assert allowed is False
+    assert elicitation_calls == ["write_file", "write_file", "write_file"]
+
+    with pytest.raises(ValueError, match=r"auto.*bypassPermissions"):
+        ex.set_permission_mode("plan")

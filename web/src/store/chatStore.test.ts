@@ -9761,6 +9761,63 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().claudePermissionMode).toBe("default");
     });
+
+    it("hydrates and updates ACP permission mode per session without native UI flags", async () => {
+      bindConversationForTest("conv_acp_a", { sessionHarness: "acp:cline" });
+      bindConversationForTest("conv_acp_b", { sessionHarness: "mirror" });
+
+      sessionLabels.set("conv_acp_a", { "omnigent.acp.permission_mode": "bypassPermissions" });
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (path === "/v1/sessions/conv_acp_a" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_acp_a",
+            agent_id: "agent_cline",
+            harness: "acp:cline",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: sessionLabels.get("conv_acp_a") ?? {},
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_acp_a");
+      expect(conversationRegistry.peek("conv_acp_a")!.getState().claudePermissionMode).toBe(
+        "bypassPermissions",
+      );
+
+      // Live SSE update for conv_acp_b stays scoped to conv_acp_b.
+      handleSessionEvent(
+        {
+          type: "session_permission_mode",
+          conversationId: "conv_acp_b",
+          permissionMode: "bypassPermissions",
+        },
+        "conv_acp_b",
+      );
+      expect(conversationRegistry.peek("conv_acp_b")!.getState().claudePermissionMode).toBe(
+        "bypassPermissions",
+      );
+      expect(conversationRegistry.peek("conv_acp_a")!.getState().claudePermissionMode).toBe(
+        "bypassPermissions",
+      );
+
+      handleSessionEvent(
+        {
+          type: "session_permission_mode",
+          conversationId: "conv_acp_a",
+          permissionMode: "auto",
+        },
+        "conv_acp_a",
+      );
+      expect(conversationRegistry.peek("conv_acp_a")!.getState().claudePermissionMode).toBe("auto");
+      expect(conversationRegistry.peek("conv_acp_b")!.getState().claudePermissionMode).toBe(
+        "bypassPermissions",
+      );
+    });
   });
 
   describe("session.codex_approval_mode", () => {

@@ -236,7 +236,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking } from "./ChatPage";
+import { Composer, computeIsWorking, shouldShowPermissionModeControl } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { withSessionMentionHint } from "@/lib/composerMentions";
@@ -9175,4 +9175,104 @@ describe("saved sandbox inference policy", () => {
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("ACP composer permission control", () => {
+  beforeEach(() => {
+    const { conversationId, sessionHarness, claudePermissionMode, setClaudePermissionMode } =
+      useChatStore.getState();
+    onTestFinished(() =>
+      useChatStore.setState({
+        conversationId,
+        sessionHarness,
+        claudePermissionMode,
+        setClaudePermissionMode,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    clearSessionDrafts();
+  });
+
+  it("enables shouldShowPermissionModeControl for ACP and Cline sessions", () => {
+    const acpHarnessIds = new Set(["cline", "mirror", "devin", "grok", "jcode"]);
+
+    expect(
+      shouldShowPermissionModeControl({ harness: "acp:cline", labels: {} }, acpHarnessIds),
+    ).toBe(true);
+    expect(shouldShowPermissionModeControl({ harness: "mirror", labels: {} }, acpHarnessIds)).toBe(
+      true,
+    );
+    expect(shouldShowPermissionModeControl({ harness: "acp", labels: {} }, acpHarnessIds)).toBe(
+      true,
+    );
+    expect(
+      shouldShowPermissionModeControl({ harness: "omnigent", labels: {} }, acpHarnessIds),
+    ).toBe(false);
+    expect(
+      shouldShowPermissionModeControl(
+        { harness: "mirror", labels: { "omnigent.wrapper": "native-ui" } },
+        acpHarnessIds,
+      ),
+    ).toBe(false);
+  });
+
+  it("renders Ask every time and Full access for ACP sessions and switches via menu and Shift+Tab", async () => {
+    const setMode = vi
+      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+      .mockImplementation(async (mode: string) => {
+        useChatStore.setState({ claudePermissionMode: mode });
+      });
+
+    useChatStore.setState({
+      conversationId: "conv-acp-perm",
+      sessionHarness: "acp:cline",
+      claudePermissionMode: "auto",
+    });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+
+    const chip = screen.getByTestId("composer-permission-chip");
+    expect(chip).toHaveTextContent("Ask every time");
+
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+    expect(screen.getByTestId("composer-permission-option-auto")).toHaveTextContent(
+      "Ask every time",
+    );
+    expect(screen.getByTestId("composer-permission-option-bypassPermissions")).toHaveTextContent(
+      "Full access",
+    );
+
+    fireEvent.click(screen.getByTestId("composer-permission-option-bypassPermissions"));
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith("bypassPermissions"));
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Full access"),
+    );
+
+    // Shift+Tab cycles back from Full access to Ask every time.
+    const input = textarea();
+    fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith("auto"));
+  });
+
+  it("keeps the ACP permission chip disabled for read-only viewers", () => {
+    useChatStore.setState({
+      conversationId: "conv-acp-ro",
+      sessionHarness: "mirror",
+      claudePermissionMode: "bypassPermissions",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          readOnlyReason: "Session is read-only",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("composer-permission-chip")).toBeDisabled();
+  });
 });

@@ -63,6 +63,11 @@ from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner._acp_timeouts import (
+    DEFAULT_INIT_TIMEOUT_SECONDS,
+    DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    resolve_timeout_seconds,
+)
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -169,16 +174,33 @@ _TOOL_STATUS_FAILED = "failed"
 # this is configurable. Parsing is import-time and fail-loud: a malformed,
 # non-positive, or non-finite value aborts the ACP child at startup.
 _PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
-_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds"
-try:
-    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
-except ValueError as exc:
-    raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
-if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
-    raise ValueError(_PROMPT_TIMEOUT_ERR)
+_IMPORT_TIME_PROMPT_TIMEOUT_SECONDS = resolve_timeout_seconds(
+    _PROMPT_TIMEOUT_ENV,
+    current_global=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    import_time_global=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    default=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+)
+_PROMPT_TIMEOUT_SECONDS = _IMPORT_TIME_PROMPT_TIMEOUT_SECONDS
 
-# Idle timeout for the initial ACP handshake (initialize / session setup).
-_INIT_TIMEOUT_SECONDS = 30.0
+# Shared deadline for the initial ACP handshake (initialize / authenticate / session setup).
+_INIT_TIMEOUT_ENV = "HARNESS_ACP_INIT_TIMEOUT_S"
+_IMPORT_TIME_INIT_TIMEOUT_SECONDS = resolve_timeout_seconds(
+    _INIT_TIMEOUT_ENV,
+    current_global=DEFAULT_INIT_TIMEOUT_SECONDS,
+    import_time_global=DEFAULT_INIT_TIMEOUT_SECONDS,
+    default=DEFAULT_INIT_TIMEOUT_SECONDS,
+)
+_INIT_TIMEOUT_SECONDS = _IMPORT_TIME_INIT_TIMEOUT_SECONDS
+
+
+def _prompt_timeout_seconds() -> float:
+    return resolve_timeout_seconds(
+        _PROMPT_TIMEOUT_ENV,
+        current_global=_PROMPT_TIMEOUT_SECONDS,
+        import_time_global=_IMPORT_TIME_PROMPT_TIMEOUT_SECONDS,
+        default=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    )
+
 
 # Agent stderr kept for diagnostics: how many trailing lines to retain, how many
 # to quote in a turn error, and the per-line cap (a chatty CLI can emit one
@@ -268,6 +290,16 @@ class AcpAgentConfig:
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
     default_model: str | None = None
+    init_timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.init_timeout_seconds is not None and (
+            not math.isfinite(self.init_timeout_seconds) or self.init_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "init_timeout_seconds must be a finite positive number, "
+                f"got {self.init_timeout_seconds!r}"
+            )
 
 
 class _AcpModelSwitchError(RuntimeError):
@@ -471,6 +503,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
+        self._permission_mode: str = config.permission_mode
         self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
@@ -842,10 +875,37 @@ class AcpExecutor(Executor):
             reason,
         )
 
-    async def _ensure_initialized(self) -> None:
+    def _resolve_init_timeout_seconds(self) -> float:
+        """Resolve the handshake/session-setup timeout, preserving per-agent and env overrides."""
+        override = self._config.init_timeout_seconds
+        if override is not None:
+            if not math.isfinite(override) or override <= 0:
+                raise ValueError("AcpAgentConfig.init_timeout_seconds must be positive and finite")
+            return float(override)
+        return resolve_timeout_seconds(
+            _INIT_TIMEOUT_ENV,
+            current_global=_INIT_TIMEOUT_SECONDS,
+            import_time_global=_IMPORT_TIME_INIT_TIMEOUT_SECONDS,
+            default=DEFAULT_INIT_TIMEOUT_SECONDS,
+        )
+
+    def _remaining_init_timeout(self, deadline: float, method: str) -> float:
+        """Return positive seconds before *deadline*, or raise an RPC-specific TimeoutError."""
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            budget = self._resolve_init_timeout_seconds()
+            raise TimeoutError(
+                f"ACP agent {self._config.name!r} did not answer {method} "
+                f"within {budget:g}s (command: {self._config.command!r})"
+            )
+        return remaining
+
+    async def _ensure_initialized(self, *, deadline: float | None = None) -> None:
         """Perform the ``initialize`` handshake if not already done."""
         if self._initialized:
             return
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._resolve_init_timeout_seconds()
         try:
             resp = await self._rpc(
                 _AGENT_METHOD_INITIALIZE,
@@ -860,7 +920,7 @@ class AcpExecutor(Executor):
                         "terminal": False,
                     },
                 },
-                timeout=_INIT_TIMEOUT_SECONDS,
+                timeout=self._remaining_init_timeout(deadline, _AGENT_METHOD_INITIALIZE),
             )
         except Exception as exc:
             # Covers the child dying or timing out before it answers.
@@ -885,17 +945,19 @@ class AcpExecutor(Executor):
         self._auth_advertisement = result if isinstance(result, dict) else {}
         self._initialized = True
 
-    async def _authenticate(self, method_id: str) -> None:
+    async def _authenticate(self, method_id: str, *, deadline: float | None = None) -> None:
         """Send ACP ``authenticate`` with *method_id* and latch success.
 
         Called reactively from :meth:`_ensure_session` after ``session/new``
         reports that authentication is required — never proactively, so agents
         whose ``session/new`` already succeeds keep their handshake untouched.
         """
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._resolve_init_timeout_seconds()
         auth_resp = await self._rpc(
             _AGENT_METHOD_AUTHENTICATE,
             {"methodId": method_id},
-            timeout=_INIT_TIMEOUT_SECONDS,
+            timeout=self._remaining_init_timeout(deadline, _AGENT_METHOD_AUTHENTICATE),
         )
         if "error" in auth_resp:
             error = auth_resp["error"]
@@ -904,7 +966,11 @@ class AcpExecutor(Executor):
         self._authenticated = True
 
     async def _authenticate_and_retry_session_new(
-        self, resp: _AcpJsonObject, params: _AcpJsonObject
+        self,
+        resp: _AcpJsonObject,
+        params: _AcpJsonObject,
+        *,
+        deadline: float | None = None,
     ) -> _AcpJsonObject:
         """Authenticate with an advertised headless method and retry once.
 
@@ -928,10 +994,16 @@ class AcpExecutor(Executor):
                     f"malformed authMethods): {message}"
                 )
             return resp
-        await self._authenticate(method_id)
-        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._resolve_init_timeout_seconds()
+        await self._authenticate(method_id, deadline=deadline)
+        return await self._rpc(
+            _AGENT_METHOD_SESSION_NEW,
+            params,
+            timeout=self._remaining_init_timeout(deadline, _AGENT_METHOD_SESSION_NEW),
+        )
 
-    async def _ensure_session(self) -> str:
+    async def _ensure_session(self, *, deadline: float | None = None) -> str:
         """Create (or reuse) an ACP session, returning the session id.
 
         In ``server`` mode we send only ``cwd`` + ``mcpServers`` and adopt the id
@@ -941,6 +1013,8 @@ class AcpExecutor(Executor):
         """
         if self._session_id is not None:
             return self._session_id
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._resolve_init_timeout_seconds()
 
         params: _AcpJsonObject = {
             "cwd": self._cwd,
@@ -955,9 +1029,13 @@ class AcpExecutor(Executor):
         if self._config.send_model_in_session_new and self._config.model:
             params["model"] = self._config.model
 
-        resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        resp = await self._rpc(
+            _AGENT_METHOD_SESSION_NEW,
+            params,
+            timeout=self._remaining_init_timeout(deadline, _AGENT_METHOD_SESSION_NEW),
+        )
         if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
-            resp = await self._authenticate_and_retry_session_new(resp, params)
+            resp = await self._authenticate_and_retry_session_new(resp, params, deadline=deadline)
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"
@@ -1178,6 +1256,15 @@ class AcpExecutor(Executor):
             args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
+    def set_permission_mode(self, mode: str) -> str:
+        """Update the live permission mode without restarting the ACP subprocess."""
+        if mode not in ("auto", "bypassPermissions"):
+            raise ValueError(
+                f"ACP permission_mode must be 'auto' or 'bypassPermissions', got {mode!r}"
+            )
+        self._permission_mode = mode
+        return mode
+
     @property
     def _bypass_permissions(self) -> bool:
         """Whether the user opted out of approval cards for this agent.
@@ -1188,7 +1275,7 @@ class AcpExecutor(Executor):
         ACP agents ask only about actions they consider permission-worthy, so
         silencing the default would drop meaningful prompts.)
         """
-        return self._config.permission_mode == "bypassPermissions"
+        return self._permission_mode == "bypassPermissions"
 
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
@@ -1878,10 +1965,13 @@ class AcpExecutor(Executor):
         # let stale data accidentally reach the session/prompt path (#4917).
         self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
+            handshake_deadline = (
+                asyncio.get_running_loop().time() + self._resolve_init_timeout_seconds()
+            )
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
-            await self._ensure_initialized()
-            session_id = await self._ensure_session()
+            await self._ensure_initialized(deadline=handshake_deadline)
+            session_id = await self._ensure_session(deadline=handshake_deadline)
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
@@ -1987,7 +2077,7 @@ class AcpExecutor(Executor):
             }
         )
 
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        deadline = loop.time() + _prompt_timeout_seconds()
         accumulated_text: list[str] = []
 
         while True:
@@ -2039,7 +2129,7 @@ class AcpExecutor(Executor):
                 await self._respond_to_agent_request(notification)
 
             # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+            deadline = loop.time() + _prompt_timeout_seconds()
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.

@@ -83,6 +83,7 @@ Canonical `executor.harness` ids:
 | Pi | `pi` | `pi-native` |
 | Grok Build | `grok` | — |
 | Jcode | `jcode` | — |
+| Mirror | `mirror` | — |
 | OpenAI | `openai-agents`, `open-responses` | — |
 | Custom ACP agent | `acp:<slug>` | — |
 
@@ -376,21 +377,22 @@ executor:
   model: <provider>/<model-id> # optional; omit for Hermes' configured default
 ```
 
-### Grok Build and Jcode
+### Grok Build, Jcode, and Mirror
 
-`harness: grok` (alias `grok-build`) and `harness: jcode` are builtin ACP CLI
-harnesses: Omnigent drives `grok agent stdio` or `jcode acp` through the same
-generic ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model
-selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
-so a `model` override is refused. When Omnigent's inference config binds
-`jcode` to an OpenAI-compatible Chat Completions provider, Omnigent writes a
-session-private Jcode config instead and forwards `model`. Jcode is not offered
-Omnigent's MCP tools. See the README's *Grok Build and Jcode* section for install
-steps.
+`harness: grok` (alias `grok-build`), `harness: jcode`, and `harness: mirror`
+are builtin ACP CLI harnesses: Omnigent drives `grok agent stdio`, `jcode acp`,
+or `mirror acp` through the same generic ACP wrap as `acp:<slug>`. By default
+each CLI owns its auth and model selection (`grok login --device-auth`, a
+provider in `~/.jcode/config.toml`, or `mirror` first-run setup /
+`REFLECTION_API_KEY`), so a `model` override is refused. When Omnigent's
+inference config binds `jcode` to an OpenAI-compatible Chat Completions
+provider, Omnigent writes a session-private Jcode config instead and forwards
+`model`. Jcode and Mirror are not offered Omnigent's MCP tools. See the README's
+*Grok Build and Jcode* section for install steps.
 
 ```yaml
 executor:
-  harness: grok                # or: jcode
+  harness: grok                # or: jcode, mirror
 ```
 
 ## Qwen Code

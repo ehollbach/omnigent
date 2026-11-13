@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
-from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, ErrorPhase, OmnigentError
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
     CompactionComplete,
@@ -1204,6 +1204,17 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is None:
             self._executor = self._executor_factory()
         return self._executor
+
+    async def set_permission_mode(self, mode: str) -> str:
+        """Update the live inner executor's permission mode when supported."""
+        executor = self._ensure_executor()
+        setter = getattr(executor, "set_permission_mode", None)
+        if not callable(setter):
+            return await super().set_permission_mode(mode)
+        try:
+            return str(setter(mode))
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""

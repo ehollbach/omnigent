@@ -35,6 +35,10 @@ from typing import Any, Protocol, TypeAlias
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner._acp_timeouts import (
+    DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    resolve_timeout_seconds,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -130,9 +134,30 @@ _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
 # How long (seconds) to wait for qwen to respond to a JSON-RPC request
-# before treating the turn as timed out.
-_PROMPT_TIMEOUT_SECONDS = 300.0
+# before treating the turn as timed out. Configurable via
+# HARNESS_QWEN_PROMPT_TIMEOUT_S or shared HARNESS_ACP_PROMPT_TIMEOUT_S.
+_PROMPT_TIMEOUT_ENV = "HARNESS_QWEN_PROMPT_TIMEOUT_S"
+_SHARED_PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
+_IMPORT_TIME_PROMPT_TIMEOUT_SECONDS = resolve_timeout_seconds(
+    _PROMPT_TIMEOUT_ENV,
+    _SHARED_PROMPT_TIMEOUT_ENV,
+    current_global=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    import_time_global=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    default=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+)
+_PROMPT_TIMEOUT_SECONDS = _IMPORT_TIME_PROMPT_TIMEOUT_SECONDS
 _INIT_TIMEOUT_SECONDS = 30.0
+
+
+def _prompt_timeout_seconds() -> float:
+    return resolve_timeout_seconds(
+        _PROMPT_TIMEOUT_ENV,
+        _SHARED_PROMPT_TIMEOUT_ENV,
+        current_global=_PROMPT_TIMEOUT_SECONDS,
+        import_time_global=_IMPORT_TIME_PROMPT_TIMEOUT_SECONDS,
+        default=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    )
+
 
 # ACP protocol version this executor targets.
 _PROTOCOL_VERSION = 1
@@ -1437,7 +1462,7 @@ class QwenExecutor(Executor):
         # Idle-based deadline: reset on every inbound message (bottom of loop),
         # so it bounds time-without-progress, not total turn length — a long
         # human approval or slow stream won't trip a spurious timeout.
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        deadline = loop.time() + _prompt_timeout_seconds()
         accumulated_text: list[str] = []
         # Per-turn token usage, summed across qwen's per-call usage emissions
         # (see _accumulate_usage). Stays empty when qwen reports none.
@@ -1561,7 +1586,7 @@ class QwenExecutor(Executor):
 
             # Inbound message = progress; reset the idle deadline. Runs after the
             # human-approval block above so a slow approval doesn't time out.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+            deadline = loop.time() + _prompt_timeout_seconds()
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""

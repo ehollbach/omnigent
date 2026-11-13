@@ -71,4 +71,10 @@ describe("permissionModeConcept", () => {
     expect(permissionModeConcept(null, "default")).toBe("default");
     expect(permissionModeConcept("codex-native", "future-mode")).toBe("default");
   });
+
+  it("maps ACP permission modes onto shared concepts", () => {
+    expect(permissionModeConcept("acp:cline", "auto")).toBe("manual");
+    expect(permissionModeConcept("acp", "bypassPermissions")).toBe("full-access");
+    expect(permissionModeConcept("mirror", "bypassPermissions")).toBe("full-access");
+  });
 });

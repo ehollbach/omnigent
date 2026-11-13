@@ -72,3 +72,29 @@ def test_acp_env_exclusion_reaches_vendor_through_daemon_and_runner(
     assert vendor_env[retained_name] == host_env[retained_name]
     assert "OMNIGENT_ACP_ENV_UNSET" not in vendor_env
     assert "UNRELATED_SECRET" not in vendor_env
+
+
+def test_runner_env_preserves_harness_timeout_overrides(tmp_path: Path) -> None:
+    timeout_env = {
+        "OMNIGENT_CONFIG_HOME": str(tmp_path),
+        "OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S": "240",
+        "HARNESS_ACP_INIT_TIMEOUT_S": "195",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S": "900",
+        "HARNESS_QWEN_PROMPT_TIMEOUT_S": "720",
+        "HARNESS_TURN_TIMEOUT_S": "1800",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": "3600",
+    }
+    with patch.dict(os.environ, timeout_env, clear=True):
+        daemon_env = _build_host_daemon_env(server_url=None)
+        runner_env = _build_runner_env(
+            daemon_env,
+            server_url="http://localhost:6767",
+            runner_id="runner_acp_timeouts",
+            binding_token="synthetic-binding",
+            workspace=str(tmp_path),
+            parent_pid=12345,
+        )
+    for key, expected in timeout_env.items():
+        if key == "OMNIGENT_CONFIG_HOME":
+            continue
+        assert runner_env[key] == expected

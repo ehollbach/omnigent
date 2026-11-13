@@ -127,4 +127,23 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         args=("acp",),
         omnigent_mcp=False,
     ),
+    # Mirror (Reflection AI) drives ``mirror acp``. Ships via ``uv tool install
+    # reflection-mirror`` and reads ``REFLECTION_API_KEY`` or its own saved
+    # interactive config; does not accept session-scoped ``mcpServers`` in
+    # ``session/new``.
+    "mirror": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Mirror",
+            "mirror",
+            None,
+            install_hint="uv tool install reflection-mirror",
+            auth_hint=(
+                "run `mirror` interactively once to save your API key and accept the "
+                "notices, or set REFLECTION_API_KEY"
+            ),
+        ),
+        args=("acp",),
+        omnigent_mcp=False,
+        env_passthrough=("REFLECTION_API_KEY",),
+    ),
 }

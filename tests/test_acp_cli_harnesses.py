@@ -407,6 +407,26 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
 
+def test_mirror_catalog_entry_and_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mirror uses ``mirror acp``, disables session MCP, and passes REFLECTION_API_KEY."""
+    row = ACP_CLI_HARNESSES["mirror"]
+    assert row.label == "Mirror"
+    assert row.binary == "mirror"
+    assert row.args == ("acp",)
+    assert row.omnigent_mcp is False
+    assert row.env_passthrough == ("REFLECTION_API_KEY",)
+    assert "reflection-mirror" in (row.install.install_hint or "")
+
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/mirror"
+    )
+    env = _build_acp_cli_spawn_env(_spec("mirror"), harness="mirror")
+    assert env["HARNESS_ACP_COMMAND"] == "/usr/local/bin/mirror acp"
+    assert env["HARNESS_ACP_NAME"] == "Mirror"
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "REFLECTION_API_KEY"
+
+
 # ---------------------------------------------------------------------------
 # jcode managed-connect support
 # ---------------------------------------------------------------------------

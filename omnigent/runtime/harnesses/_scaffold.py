@@ -416,13 +416,30 @@ class PolicyVerdictEvent(BaseModel):
     data: dict[str, Any] | None = None
 
 
+class PermissionModeChangeEvent(BaseModel):
+    """Downward ``permission_mode_change`` event — switch live harness permission stance.
+
+    :param type: Event discriminator; always ``"permission_mode_change"``.
+    :param permission_mode: Target permission mode, e.g. ``"auto"`` or
+        ``"bypassPermissions"``.
+    """
+
+    type: Literal["permission_mode_change"]
+    permission_mode: str
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | PermissionModeChangeEvent,
     Field(discriminator="type"),
 ]
 
@@ -988,6 +1005,18 @@ class HarnessApp:
         """
         raise NotImplementedError
 
+    async def set_permission_mode(self, mode: str) -> str:
+        """Switch the running harness's permission mode in place.
+
+        Subclasses supporting live permission switches override this method and
+        return the settled mode. Unsupported harnesses raise ``INVALID_INPUT`` so
+        the runner does not confirm a change it cannot apply.
+        """
+        raise OmnigentError(
+            f"permission_mode_change is not supported by {type(self).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
         Per-harness turn execution.
@@ -1403,6 +1432,9 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, PermissionModeChangeEvent):
+            settled = await self.set_permission_mode(body.permission_mode)
+            return JSONResponse(status_code=200, content={"permission_mode": settled})
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.

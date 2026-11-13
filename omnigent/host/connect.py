@@ -833,8 +833,15 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Idle-reap windows and the human-wait hold the runner reads at boot
         # (``0`` disables each). Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
         "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
+        # ACP / Qwen / harness turn prompt and handshake timeout overrides.
+        "HARNESS_ACP_INIT_TIMEOUT_S",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S",
+        "HARNESS_QWEN_PROMPT_TIMEOUT_S",
+        "HARNESS_TURN_TIMEOUT_S",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the

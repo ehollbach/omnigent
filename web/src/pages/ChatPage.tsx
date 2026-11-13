@@ -82,6 +82,7 @@ import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
+  useAcpHarnessIds,
   useBrainHarnessLabels,
   useFileMentionHarnesses,
   useHarnessEffortFamilies,
@@ -342,8 +343,12 @@ import {
 } from "@/lib/composerCapabilities";
 
 import {
+  ACP_DEFAULT_PERMISSION_MODE,
+  ACP_PERMISSION_MODES,
+  acpPermissionModeLabel,
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
+  isAcpPermissionSession,
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
 import {
@@ -1267,6 +1272,7 @@ export function ChatPage() {
     composerSessionModelSeeded,
     activeConversationId,
   ]);
+  const acpHarnessIds = useAcpHarnessIds();
   const modelPickerKind = modelPickerKindForConv(capabilitySource, codexModelOptions);
   // Effort ladders key on the model the session is actually on — the reported
   // `llmModel` — then the session's pinned `model_override`. The override matters for a harness that never reports a
@@ -1387,7 +1393,8 @@ export function ChatPage() {
       modelsFromLaunchPreview={modelsFromLaunchPreview}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource, acpHarnessIds)}
+      acpHarnessIds={acpHarnessIds}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
@@ -1556,6 +1563,7 @@ interface MainAgentSurfaceProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  acpHarnessIds?: ReadonlySet<string>;
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
@@ -2203,6 +2211,7 @@ interface ComposerProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  acpHarnessIds?: ReadonlySet<string>;
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
@@ -2558,6 +2567,7 @@ function ComposerImpl(
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
+    acpHarnessIds,
     showCodexApprovalMode = false,
     showGoalControl = false,
     runnerOnline,
@@ -2859,20 +2869,33 @@ function ComposerImpl(
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
+  // ACP sessions (Cline / acp:<slug> / builtin ACP CLI rows) offer
+  // Ask every time ("auto") and Full access ("bypassPermissions").
   const devinPermissionControl = modelPickerKind === "devin";
+  const acpPermissionControl =
+    !devinPermissionControl &&
+    !wrapperLabel &&
+    isAcpPermissionSession({ harness: sessionHarness }, acpHarnessIds);
   const permissionOptions = showClaudePermissionMode
     ? devinPermissionControl
       ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      : acpPermissionControl
+        ? ACP_PERMISSION_MODES
+        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+  const effectiveClaudePermissionMode = acpPermissionControl
+    ? claudePermissionMode || ACP_DEFAULT_PERMISSION_MODE
+    : claudePermissionMode;
   const permissionLabel = showClaudePermissionMode
     ? devinPermissionControl
       ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
         claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
+      : acpPermissionControl
+        ? acpPermissionModeLabel(effectiveClaudePermissionMode)
+        : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
   const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
+    ? effectiveClaudePermissionMode
     : codexApprovalMode;
   const permissionControlInteractive =
     (showClaudePermissionMode || showCodexApprovalMode) &&
@@ -2886,7 +2909,10 @@ function ComposerImpl(
   );
   const currentPermissionMode = (): string => {
     const state = useChatStore.getState();
-    return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
+    if (!showClaudePermissionMode) return state.codexApprovalMode;
+    return acpPermissionControl
+      ? state.claudePermissionMode || ACP_DEFAULT_PERMISSION_MODE
+      : state.claudePermissionMode;
   };
   /** Applies *mode*; resolves whether the session landed on it. */
   const changePermission = async (mode: string): Promise<boolean> => {
@@ -5297,11 +5323,19 @@ export function shouldShowCodexPlanModeControl(
  * :returns: True only for sessions running the claude-native wrapper.
  */
 export function shouldShowPermissionModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+  acpHarnessIds?: ReadonlySet<string>,
 ): boolean {
   // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
   // gets the same control — with its own vocabulary (see `permissionOptions`).
-  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
+  // ACP sessions (Cline, acp:<slug>, builtin ACP CLI rows) expose Ask every
+  // time ("auto") vs Full access ("bypassPermissions").
+  return (
+    isClaudeNativeSession(conv) ||
+    modelPickerKindForConv(conv) === "devin" ||
+    isAcpPermissionSession(conv, acpHarnessIds)
+  );
 }
 
 /**

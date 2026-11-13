@@ -1464,6 +1464,9 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
+    # session_id → confirmed ACP permission mode (``"auto"`` or ``"bypassPermissions"``),
+    # seeded from session-init labels and updated live by ``permission_mode_change``.
+    _session_acp_permission_modes: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -2945,6 +2948,7 @@ def create_runner_app(
                 harness_override=body.harness_override,
                 sub_agent_name=sub_agent_name,
                 cwd=resolver_cwd,
+                acp_permission_mode_override=_session_acp_permission_modes.get(conversation_id),
             )
             generator_spec = generator_spec_for_harness(effective_harness)
             if generator_spec is None:
@@ -2960,6 +2964,9 @@ def create_runner_app(
                     harness_override=resolver_harness,
                     sub_agent_name=sub_agent_name,
                     cwd=resolver_cwd,
+                    acp_permission_mode_override=_session_acp_permission_modes.get(
+                        conversation_id
+                    ),
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
@@ -3129,6 +3136,9 @@ def create_runner_app(
         resource_registry.set_client_surface(
             session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
         )
+        acp_permission_label = surface_labels.get("omnigent.acp.permission_mode")
+        if acp_permission_label in ("auto", "bypassPermissions"):
+            _session_acp_permission_modes[session_id] = acp_permission_label
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
@@ -3240,6 +3250,7 @@ def create_runner_app(
                     session_id=session_id,
                     model_override=_model_override,
                     resource_registry=resource_registry,
+                    acp_permission_mode_override=_session_acp_permission_modes.get(session_id),
                 )
             except OmnigentError as exc:
                 # The relay also needs the failure when init precedes the first turn.
@@ -4149,6 +4160,7 @@ def create_runner_app(
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
+        _session_acp_permission_modes.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -6173,6 +6185,7 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
                 resource_registry=resource_registry,
+                acp_permission_mode_override=_session_acp_permission_modes.get(conv),
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -6579,6 +6592,7 @@ def create_runner_app(
                     ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
+                    acp_permission_mode_override=_session_acp_permission_modes.get(conv_id),
                 )
             except SessionAgentMissingError:
                 return JSONResponse(
@@ -8359,7 +8373,9 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "devin-native"):
+            canonical_harness = canonicalize_harness(harness) if harness else None
+            is_acp_harness = canonical_harness == "acp" or harness in ACP_CLI_HARNESSES
+            if harness in ("claude-native", "devin-native") or is_acp_harness:
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
                     return JSONResponse(
@@ -8369,6 +8385,61 @@ def create_runner_app(
                             "detail": "Body 'permission_mode' must be a string or null",
                         },
                     )
+                if is_acp_harness:
+                    if mode not in ("auto", "bypassPermissions"):
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": "invalid_input",
+                                "detail": (
+                                    "Body 'permission_mode' must be 'auto' or "
+                                    "'bypassPermissions' for ACP sessions"
+                                ),
+                            },
+                        )
+                    try:
+                        harness_client = await process_manager.get_client(conversation_id, "any")
+                    except NoLiveHarnessError:
+                        _session_acp_permission_modes[conversation_id] = mode
+                        return JSONResponse(status_code=200, content={"permission_mode": mode})
+                    try:
+                        fwd_resp = await harness_client.post(
+                            f"/v1/sessions/{conversation_id}/events",
+                            json={"type": "permission_mode_change", "permission_mode": mode},
+                        )
+                    except httpx.HTTPError as exc:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "acp_permission_mode_failed",
+                                "detail": _client_safe_error_detail(
+                                    exc, context="ACP permission mode change"
+                                ),
+                            },
+                        )
+                    if fwd_resp.status_code != 200:
+                        return JSONResponse(
+                            status_code=400 if fwd_resp.status_code == 400 else 503,
+                            content={
+                                "error": "acp_permission_mode_failed",
+                                "detail": (
+                                    f"ACP harness returned {fwd_resp.status_code} "
+                                    "for permission_mode_change"
+                                ),
+                            },
+                        )
+                    payload = fwd_resp.json()
+                    settled = payload.get("permission_mode") if isinstance(payload, dict) else None
+                    if not isinstance(settled, str) or not settled:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "acp_permission_mode_failed",
+                                "detail": "ACP harness did not confirm permission_mode",
+                            },
+                        )
+                    _session_acp_permission_modes[conversation_id] = settled
+                    return JSONResponse(status_code=200, content={"permission_mode": settled})
                 if harness == "devin-native":
                     return await _handle_devin_native_permission_mode_change(
                         conversation_id,
@@ -9433,6 +9504,7 @@ async def _resolve_harness_config(
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    acp_permission_mode_override: str | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -9494,6 +9566,7 @@ async def _resolve_harness_config(
                 model_override=model_override,
                 session_id=session_id,
                 resource_registry=resource_registry,
+                acp_permission_mode_override=acp_permission_mode_override,
             )
             return harness, spawn_env
 
@@ -9612,6 +9685,7 @@ def _build_spawn_env_from_spec(
     model_override: str | None = None,
     session_id: str | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    acp_permission_mode_override: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -9765,6 +9839,13 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    if (
+        env is not None
+        and acp_permission_mode_override is not None
+        and (harness == "acp" or harness in ACP_CLI_HARNESSES)
+    ):
+        env["HARNESS_ACP_PERMISSION_MODE"] = acp_permission_mode_override
 
     if env is not None:
         from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env

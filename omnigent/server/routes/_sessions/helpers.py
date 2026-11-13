@@ -4964,39 +4964,57 @@ def _require_collaboration_mode_forward(
         )
 
 
+def _is_acp_permission_mode_harness(harness: str | None) -> bool:
+    """True when *harness* runs via the generic ACP wrap with live permission modes."""
+    if not harness:
+        return False
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harness_aliases import canonicalize_harness
+
+    canonical = canonicalize_harness(harness) or harness
+    return canonical == "acp" or canonical in ACP_CLI_HARNESSES or harness in ACP_CLI_HARNESSES
+
+
 def _require_permission_mode_forward(
     session_id: str,
     mode: str,
     runner_result: _RunnerForwardResult | None,
+    *,
+    require_confirmation: bool = False,
 ) -> str:
     """
-    Fail when a live claude-native permission-mode switch wasn't applied.
+    Fail when a live permission-mode switch wasn't applied.
 
-    The mode lives in the running TUI, so persisting the label without a
-    confirmed 2xx forward would let the UI claim auto mode while Claude still
-    prompts on every edit. Returns the mode the runner actually reached, so
-    the caller stores what the pane shows rather than what was asked for.
+    The mode lives in the running harness/TUI, so persisting the label without a
+    confirmed 2xx forward would let the UI claim a mode the session isn't in.
+    Returns the mode the runner actually reached, so the caller stores what
+    the runner reports rather than what was asked for.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param mode: Requested permission mode, e.g. ``"auto"``.
     :param runner_result: HTTP result returned by the runner, or ``None``
         when no runner could be reached.
-    :returns: The mode the runner reports the pane is now in — the
-        requested *mode* when the runner didn't echo one back.
-    :raises OmnigentError: If no runner was reachable or the runner could
-        not switch the session into *mode*.
+    :param require_confirmation: When True (used for ACP), reject empty
+        ``204`` responses or missing ``permission_mode`` JSON confirmations so
+        an old runner reports that it needs an update rather than saving an
+        unapplied mode.
+    :returns: The mode the runner reports the session is now in — the
+        requested *mode* when *require_confirmation* is False and the runner
+        didn't echo one back.
+    :raises OmnigentError: If no runner was reachable, the runner could not
+        switch the session into *mode*, or an older runner returned a silent
+        no-op when *require_confirmation* is True.
     """
     if runner_result is None:
         raise OmnigentError(
-            f"Could not switch to {mode} mode: no live Claude runner is available "
+            f"Could not switch to {mode} mode: no live runner is available "
             f"for session {session_id!r}. Reconnect the session and try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
     if not 200 <= runner_result.status_code < 300:
-        # The runner's body carries why the cycle failed (e.g. the mode
-        # isn't in this session's cycle); surface it so the UI banner
-        # explains the failure instead of showing a bare status code.
+        # The runner's body carries why the switch failed; surface it so the UI
+        # banner explains the failure instead of showing a bare status code.
         detail = ""
         try:
             payload = json.loads(runner_result.body)
@@ -5011,9 +5029,18 @@ def _require_permission_mode_forward(
     try:
         body = json.loads(runner_result.body)
     except (TypeError, ValueError):
-        return mode
+        body = None
     settled = body.get("permission_mode") if isinstance(body, dict) else None
-    return settled if isinstance(settled, str) and settled else mode
+    if isinstance(settled, str) and settled:
+        return settled
+    if require_confirmation:
+        raise OmnigentError(
+            f"Could not switch to {mode} mode for session {session_id!r}: "
+            "the connected runner does not support live ACP permission-mode "
+            "changes and needs an update.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    return mode
 
 
 def _publish_child_status_to_parent(session_id: str, status: str) -> None:

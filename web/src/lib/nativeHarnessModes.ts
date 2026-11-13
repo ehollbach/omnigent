@@ -6,6 +6,7 @@
 // native CLI; a mode whose `args` are empty sends no flags (the CLI keeps its
 // own configured default). Keep in sync with each CLI's `--help`.
 
+import { LEGACY_ACP_CLI_HARNESS_IDS } from "@/lib/agentGrouping";
 import {
   CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   CLAUDE_NATIVE_PERMISSION_MODES,
@@ -50,6 +51,10 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     default: "manual",
     skip: "full-access",
   },
+  acp: {
+    auto: "manual",
+    bypassPermissions: "full-access",
+  },
 };
 
 const NATIVE_HARNESS_ALIASES: Record<string, string> = {
@@ -74,12 +79,15 @@ export function harnessAccountKey(harness: string): string {
   return canonical;
 }
 
-/** Shared permission concept for presentation across native harness vocabularies. */
+/** Shared permission concept for presentation across native and ACP harness vocabularies. */
 export function permissionModeConcept(
   harness: string | null | undefined,
   value: string | null | undefined,
 ): PermissionModeConcept {
   if (!harness || !value) return "default";
+  if (harness === "acp" || harness.startsWith("acp:") || LEGACY_ACP_CLI_HARNESS_IDS.has(harness)) {
+    return PERMISSION_MODE_CONCEPTS.acp?.[value] ?? "default";
+  }
   const canonicalHarness = canonicalNativeHarness(harness);
   return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
 }

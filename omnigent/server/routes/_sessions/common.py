@@ -256,6 +256,8 @@ _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"
 # ``terminal_launch_args`` records only the launch mode, so this label is what
 # the web UI reads back after a reload.
 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+_ACP_PERMISSION_MODE_LABEL_KEY = "omnigent.acp.permission_mode"
+_ACP_PERMISSION_MODES: frozenset[str] = frozenset({"auto", "bypassPermissions"})
 
 
 # Permission modes switchable on a running session — the ones Claude
@@ -1114,6 +1116,8 @@ __all__ = [
     "CLIENT_SESSION_EVENT_TYPES",
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
+    "_ACP_PERMISSION_MODES",
+    "_ACP_PERMISSION_MODE_LABEL_KEY",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_ANTIGRAVITY_NATIVE_HARNESS",

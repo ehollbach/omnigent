@@ -2,9 +2,11 @@
 // `--permission-mode` accepts when starting a session, and the subset a
 // running session can be switched to (see the SWITCHABLE list below).
 
+import { LEGACY_ACP_CLI_HARNESS_IDS } from "@/lib/agentGrouping";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 const CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode";
+export const ACP_PERMISSION_MODE_LABEL_KEY = "omnigent.acp.permission_mode";
 const CLAUDE_NATIVE_WRAPPER = nativeCodingAgentForHarness("claude-native")?.wrapperLabel;
 
 /** Whether a session runs the claude-native wrapper. Fails closed. */
@@ -69,6 +71,63 @@ export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOpti
 
 export function isSwitchableClaudePermissionMode(mode: string | null | undefined): boolean {
   return CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.some((m) => m.value === mode);
+}
+
+export const ACP_DEFAULT_PERMISSION_MODE = "auto";
+
+export const ACP_PERMISSION_MODES: ClaudePermissionModeOption[] = [
+  {
+    value: "auto",
+    label: "Ask every time",
+    description: "Prompts before each tool runs",
+  },
+  {
+    value: "bypassPermissions",
+    label: "Full access",
+    description: "Runs everything; no prompts or safety checks",
+  },
+];
+
+/** Whether a session runs an ACP harness (generic ``acp:<slug>`` or builtin CLI row). */
+export function isAcpPermissionSession(
+  session:
+    | {
+        harness?: string | null;
+        labels?: Record<string, string | null> | null;
+      }
+    | null
+    | undefined,
+  acpHarnessIds?: ReadonlySet<string>,
+): boolean {
+  const harness = session?.harness;
+  if (!harness) return false;
+  if (session?.labels?.[WRAPPER_LABEL_KEY]) return false;
+  return (
+    harness === "acp" ||
+    harness.startsWith("acp:") ||
+    (acpHarnessIds?.has(harness) ?? false) ||
+    LEGACY_ACP_CLI_HARNESS_IDS.has(harness)
+  );
+}
+
+/** Human label for an ACP permission mode value. */
+export function acpPermissionModeLabel(mode: string | null | undefined): string {
+  if (!mode) return "";
+  return ACP_PERMISSION_MODES.find((m) => m.value === mode)?.label ?? mode;
+}
+
+/** Active permission mode for an ACP session, defaulting to ``"auto"`` ("Ask every time"). */
+export function acpPermissionModeFromSession(
+  session:
+    | {
+        labels?: Record<string, string | null> | null;
+      }
+    | null
+    | undefined,
+): string {
+  const labelled = session?.labels?.[ACP_PERMISSION_MODE_LABEL_KEY];
+  if (labelled === "auto" || labelled === "bypassPermissions") return labelled;
+  return ACP_DEFAULT_PERMISSION_MODE;
 }
 
 /** Human label for a mode value, falling back to the raw value. */

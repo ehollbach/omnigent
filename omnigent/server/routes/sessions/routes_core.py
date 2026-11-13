@@ -138,6 +138,8 @@ from omnigent.server.routes._errors import session_not_found as _session_not_fou
 from omnigent.server.routes._host_launch import _deployment_is_sharded
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
+    _ACP_PERMISSION_MODE_LABEL_KEY,
+    _ACP_PERMISSION_MODES,
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -173,6 +175,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _is_acp_permission_mode_harness,
     _is_codex_native_subagent,
     _live_settings_change,
     _LiveSettingsChange,
@@ -3710,6 +3713,7 @@ def register_core_routes(
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
         requested_permission_mode: str | None = None
+        is_acp_permission_session = False
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
@@ -3722,9 +3726,8 @@ def register_core_routes(
             )
             if conv_for_permission_mode is None:
                 raise _session_not_found()
-            # The mode lives in the harness's own TUI, so both the eligible wrapper
-            # and the vocabulary are per harness — Devin's rungs are not Claude's,
-            # and validating one against the other would reject a valid switch.
+            # The mode lives in the harness's own runner/TUI, so both the
+            # eligible harness and the vocabulary are per harness.
             wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
                 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
             )
@@ -3735,11 +3738,21 @@ def register_core_routes(
 
                 allowed_permission_modes = DEVIN_PERMISSION_MODES
             else:
-                raise OmnigentError(
-                    "permission_mode is only supported for claude-native and "
-                    "devin-native sessions",
-                    code=ErrorCode.INVALID_INPUT,
+                resolved_harness = await asyncio.to_thread(
+                    _resolve_harness,
+                    conv_for_permission_mode,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
                 )
+                if _is_acp_permission_mode_harness(resolved_harness):
+                    allowed_permission_modes = tuple(_ACP_PERMISSION_MODES)
+                    is_acp_permission_session = True
+                else:
+                    raise OmnigentError(
+                        "permission_mode is only supported for claude-native, "
+                        "devin-native, and ACP sessions",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
             if body.permission_mode not in allowed_permission_modes:
                 raise OmnigentError(
                     f"permission_mode must be one of {sorted(allowed_permission_modes)}",
@@ -4543,40 +4556,53 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        if requested_permission_mode is not None and live_forward:
-            _mode_result = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {
-                    "type": "permission_mode_change",
-                    "permission_mode": requested_permission_mode,
-                },
-            )
-            # Raises unless the runner confirms the switch, so the label can
-            # never claim a mode Claude isn't in. Stores the mode it reached.
-            _confirmed_permission_mode = _require_permission_mode_forward(
-                session_id,
-                requested_permission_mode,
-                _mode_result,
-            )
-            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
-            # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so pin the confirmed mode there too — otherwise a
-            # relaunch reopens in the launch mode, which is Claude's default
-            # (manual) for a session created without --permission-mode. Merge
-            # against ``updated`` (the post-write row), not the pre-update
-            # snapshot, so a combined PATCH that also set terminal_launch_args
-            # keeps those.
-            _merged_permission_args = _pin_claude_permission_launch_args(
-                updated.terminal_launch_args,
-                _confirmed_permission_mode,
-            )
-            if updated.terminal_launch_args != _merged_permission_args:
-                await asyncio.to_thread(
-                    conversation_store.update_conversation,
+        if requested_permission_mode is not None:
+            if not live_forward:
+                if is_acp_permission_session:
+                    raise OmnigentError(
+                        "permission_mode cannot be changed silently for ACP sessions",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            else:
+                _mode_result = await _forward_session_change_to_runner(
                     session_id,
-                    terminal_launch_args=_merged_permission_args,
+                    runner_router,
+                    {
+                        "type": "permission_mode_change",
+                        "permission_mode": requested_permission_mode,
+                    },
                 )
+                # Raises unless the runner confirms the switch, so the label can
+                # never claim a mode the session isn't in. Stores the mode it reached.
+                _confirmed_permission_mode = _require_permission_mode_forward(
+                    session_id,
+                    requested_permission_mode,
+                    _mode_result,
+                    require_confirmation=is_acp_permission_session,
+                )
+                if is_acp_permission_session:
+                    labels_to_set[_ACP_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
+                else:
+                    labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = (
+                        _confirmed_permission_mode
+                    )
+                    # The launcher restores the mode from terminal_launch_args, not the
+                    # label above, so pin the confirmed mode there too — otherwise a
+                    # relaunch reopens in the launch mode, which is Claude's default
+                    # (manual) for a session created without --permission-mode. Merge
+                    # against ``updated`` (the post-write row), not the pre-update
+                    # snapshot, so a combined PATCH that also set terminal_launch_args
+                    # keeps those.
+                    _merged_permission_args = _pin_claude_permission_launch_args(
+                        updated.terminal_launch_args,
+                        _confirmed_permission_mode,
+                    )
+                    if updated.terminal_launch_args != _merged_permission_args:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            terminal_launch_args=_merged_permission_args,
+                        )
         if requested_codex_approval_mode is not None and live_forward:
             _approval_result = await _forward_session_change_to_runner(
                 session_id,
@@ -4659,6 +4685,11 @@ def register_core_routes(
             _publish_permission_mode(
                 session_id,
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
+            )
+        if _ACP_PERMISSION_MODE_LABEL_KEY in labels_to_set:
+            _publish_permission_mode(
+                session_id,
+                labels_to_set[_ACP_PERMISSION_MODE_LABEL_KEY],
             )
         if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
             _publish_codex_approval_mode(
@@ -5108,6 +5139,7 @@ def register_core_routes(
             from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add(_ACP_PERMISSION_MODE_LABEL_KEY)
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )

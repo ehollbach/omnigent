@@ -110,4 +110,44 @@ describe("claudePermissionMode", () => {
       ).toBeNull();
     });
   });
+
+  describe("ACP permission mode helpers", () => {
+    it("recognizes ACP harnesses and excludes non-ACP harnesses", async () => {
+      const {
+        ACP_PERMISSION_MODES,
+        acpPermissionModeFromSession,
+        acpPermissionModeLabel,
+        isAcpPermissionSession,
+      } = await import("@/lib/claudePermissionMode");
+
+      expect(ACP_PERMISSION_MODES.map((m) => [m.value, m.label])).toEqual([
+        ["auto", "Ask every time"],
+        ["bypassPermissions", "Full access"],
+      ]);
+      expect(isAcpPermissionSession({ harness: "acp:cline" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "acp" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "mirror" })).toBe(true);
+      expect(
+        isAcpPermissionSession({ harness: "mirror", labels: { "omnigent.wrapper": "native-ui" } }),
+      ).toBe(false);
+      expect(isAcpPermissionSession({ harness: "claude-native" })).toBe(false);
+      expect(isAcpPermissionSession({ harness: "omnigent" })).toBe(false);
+      expect(isAcpPermissionSession(null)).toBe(false);
+
+      expect(acpPermissionModeLabel("auto")).toBe("Ask every time");
+      expect(acpPermissionModeLabel("bypassPermissions")).toBe("Full access");
+
+      expect(acpPermissionModeFromSession({})).toBe("auto");
+      expect(
+        acpPermissionModeFromSession({
+          labels: { "omnigent.acp.permission_mode": "bypassPermissions" },
+        }),
+      ).toBe("bypassPermissions");
+      expect(
+        acpPermissionModeFromSession({
+          labels: { "omnigent.acp.permission_mode": "unknown" },
+        }),
+      ).toBe("auto");
+    });
+  });
 });

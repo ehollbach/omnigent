@@ -2455,3 +2455,116 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
         await _cancel_pending(get_task, shutdown_task)
         # Idempotent if the test already shut down; still safe if it failed early.
         await manager.shutdown()
+
+
+def test_spawn_ready_timeout_defaults_and_validated_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spawn readiness defaults to 180s and validates env overrides."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.delenv("OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S", raising=False)
+    assert pm_mod._DEFAULT_SPAWN_READY_TIMEOUT_S == 180.0
+    assert pm_mod._SPAWN_READY_TIMEOUT_S == 180.0
+    assert pm_mod._spawn_ready_timeout_s() == 180.0
+
+    monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S", "240")
+    assert pm_mod._spawn_ready_timeout_s() == 240.0
+
+    for bad in ("0", "-1", "nan", "inf", "not-a-number"):
+        monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S", bad)
+        with pytest.raises(ValueError, match="OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S"):
+            pm_mod._spawn_ready_timeout_s()
+
+
+def test_acp_startup_config_excludes_permission_mode_and_model() -> None:
+    """Toggling live ACP permission mode or model does not force a subprocess respawn."""
+    from omnigent.runtime.harnesses.process_manager import _acp_startup_config
+
+    base = _acp_startup_config(
+        {
+            "HARNESS_ACP_COMMAND": "cline --acp",
+            "HARNESS_ACP_PERMISSION_MODE": "auto",
+            "HARNESS_ACP_MODEL": "sonnet",
+            "UNRELATED_KEY": "ignored",
+        }
+    )
+    switched = _acp_startup_config(
+        {
+            "HARNESS_ACP_COMMAND": "cline --acp",
+            "HARNESS_ACP_PERMISSION_MODE": "bypassPermissions",
+            "HARNESS_ACP_MODEL": "opus",
+            "UNRELATED_KEY": "changed",
+        }
+    )
+    changed_cmd = _acp_startup_config(
+        {
+            "HARNESS_ACP_COMMAND": "mirror acp",
+            "HARNESS_ACP_PERMISSION_MODE": "auto",
+        }
+    )
+
+    assert base == switched
+    assert changed_cmd != base
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bind_reports_stage_specific_errors_and_delayed_bind(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_wait_for_bind`` tolerates slow startup and fails loudly on exit or timeout."""
+    import socket as sock_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    socket_path = short_tmp_parent / "delayed.sock"
+    exited_proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import sys; sys.exit(7)"
+    )
+    await exited_proc.wait()
+    with pytest.raises(RuntimeError, match="exited with 7 during spawn"):
+        await pm_mod._wait_for_bind(
+            exited_proc,
+            pm_mod._HarnessEndpoint(socket_path=socket_path),
+            "test-harness",
+            "conv_exit",
+        )
+
+    sleeping_proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(30)"
+    )
+    try:
+        server = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+
+        async def _bind_soon() -> None:
+            await asyncio.sleep(0.05)
+            server.bind(str(socket_path))
+            server.listen(1)
+
+        binder = asyncio.create_task(_bind_soon())
+        try:
+            monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S", "2.0")
+            await pm_mod._wait_for_bind(
+                sleeping_proc,
+                pm_mod._HarnessEndpoint(socket_path=socket_path),
+                "test-harness",
+                "conv_ok",
+            )
+        finally:
+            await binder
+            server.close()
+
+        missing_socket = short_tmp_parent / "never.sock"
+        monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_READY_TIMEOUT_S", "0.1")
+        with pytest.raises(RuntimeError, match="did not bind its endpoint within"):
+            await pm_mod._wait_for_bind(
+                sleeping_proc,
+                pm_mod._HarnessEndpoint(socket_path=missing_socket),
+                "test-harness",
+                "conv_timeout",
+            )
+    finally:
+        if sleeping_proc.returncode is None:
+            sleeping_proc.kill()
+            await sleeping_proc.wait()
