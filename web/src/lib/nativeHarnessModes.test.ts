@@ -75,6 +75,8 @@ describe("permissionModeConcept", () => {
   it("maps ACP permission modes onto shared concepts", () => {
     expect(permissionModeConcept("acp:cline", "auto")).toBe("manual");
     expect(permissionModeConcept("acp", "bypassPermissions")).toBe("full-access");
+    expect(permissionModeConcept("grok-build", "bypassPermissions")).toBe("full-access");
     expect(permissionModeConcept("mirror", "bypassPermissions")).toBe("full-access");
+    expect(permissionModeConcept("devin", "bypassPermissions")).toBe("default");
   });
 });

@@ -9275,4 +9275,21 @@ describe("ACP composer permission control", () => {
     );
     expect(screen.getByTestId("composer-permission-chip")).toBeDisabled();
   });
+
+  it("uses acpHarnessIds prop to identify catalog-backed builtin ACP harnesses in Composer", () => {
+    useChatStore.setState({
+      conversationId: "conv-acp-catalog",
+      sessionHarness: "custom-acp",
+      claudePermissionMode: "auto",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          acpHarnessIds: new Set(["custom-acp"]),
+        })}
+      />,
+    );
+    expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask every time");
+  });
 });

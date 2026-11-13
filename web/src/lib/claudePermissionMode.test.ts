@@ -126,7 +126,11 @@ describe("claudePermissionMode", () => {
       ]);
       expect(isAcpPermissionSession({ harness: "acp:cline" })).toBe(true);
       expect(isAcpPermissionSession({ harness: "acp" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "grok" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "grok-build" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "jcode" })).toBe(true);
       expect(isAcpPermissionSession({ harness: "mirror" })).toBe(true);
+      expect(isAcpPermissionSession({ harness: "devin" })).toBe(false);
       expect(
         isAcpPermissionSession({ harness: "mirror", labels: { "omnigent.wrapper": "native-ui" } }),
       ).toBe(false);

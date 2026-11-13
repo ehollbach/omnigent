@@ -4717,3 +4717,105 @@ async def test_events_permission_mode_change_on_acp_session_forwards_and_persist
             json={"type": "permission_mode_change", "permission_mode": "plan"},
         )
         assert hbad.status_code == 400, hbad.text
+
+
+@pytest.mark.asyncio
+async def test_events_permission_mode_change_accepts_acp_cli_alias_and_reconnect_snapshot(
+    tmp_path: Path,
+) -> None:
+    """ACP CLI aliases (e.g. grok-build) and reconnect snapshots seed permission mode."""
+    sid = "8b223344556677889900aabbccddeeff"
+    agent_id = "880b5afda28ad55ff74cbeb9b5fc67fb"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    from tests.runner.conftest import _spec_resolver_returning
+
+    grok_alias_spec = AgentSpec(
+        spec_version=1,
+        name="grok-alias",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "grok-build"},
+        ),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{sid}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": sid,
+                    "agent_id": agent_id,
+                    "workspace": str(workspace),
+                    "labels": {"omnigent.acp.permission_mode": "bypassPermissions"},
+                },
+            )
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{sid}/items":
+            return httpx.Response(200, json={"items": []})
+        return httpx.Response(200, json={})
+
+    pm = _FakeProcessManager(
+        _ScriptedHarnessClient([_sse({"type": "response.completed", "response": {"id": "r1"}})])
+    )
+
+    async def _post_with_json(url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        del url, timeout
+
+        class _JsonResp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            content = b'{"permission_mode":"auto"}'
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"permission_mode": json["permission_mode"]}
+
+        return _JsonResp()
+
+    pm._client.post = _post_with_json  # type: ignore[attr-defined]
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        runner_workspace=workspace,
+        spec_resolver=await _spec_resolver_returning(grok_alias_spec),
+        server_client=server_client,
+        process_manager=pm,  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            # Trigger _session_snapshot without /init (e.g. runner reconnect).
+            reset_resp = await client.post(f"/v1/sessions/{sid}/agent-cache/reset", json={})
+            assert reset_resp.status_code == 200, reset_resp.text
+
+            # Turns without /init must inherit HARNESS_ACP_PERMISSION_MODE from the snapshot.
+            turn_resp = await client.post(
+                f"/v1/sessions/{sid}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "agent_id": agent_id,
+                },
+            )
+            assert turn_resp.status_code == 200, turn_resp.text
+            assert pm.get_client_calls, (
+                "expected turn dispatch to invoke process_manager.get_client"
+            )
+            _cid, _harness, spawn_env = pm.get_client_calls[-1]
+            assert spawn_env is not None
+            assert spawn_env.get("HARNESS_ACP_PERMISSION_MODE") == "bypassPermissions"
+
+            # Canonical alias grok-build -> grok (in ACP_CLI_HARNESSES) must work on /events.
+            ev_resp = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "permission_mode_change", "permission_mode": "auto"},
+            )
+            assert ev_resp.status_code == 200, ev_resp.text
+            assert ev_resp.json() == {"permission_mode": "auto"}
+    finally:
+        await server_client.aclose()

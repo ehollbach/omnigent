@@ -2,7 +2,6 @@
 // `--permission-mode` accepts when starting a session, and the subset a
 // running session can be switched to (see the SWITCHABLE list below).
 
-import { LEGACY_ACP_CLI_HARNESS_IDS } from "@/lib/agentGrouping";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 const CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode";
@@ -88,6 +87,8 @@ export const ACP_PERMISSION_MODES: ClaudePermissionModeOption[] = [
   },
 ];
 
+export const ACP_CLI_HARNESS_IDS = new Set<string>(["grok", "grok-build", "jcode", "mirror"]);
+
 /** Whether a session runs an ACP harness (generic ``acp:<slug>`` or builtin CLI row). */
 export function isAcpPermissionSession(
   session:
@@ -106,7 +107,7 @@ export function isAcpPermissionSession(
     harness === "acp" ||
     harness.startsWith("acp:") ||
     (acpHarnessIds?.has(harness) ?? false) ||
-    LEGACY_ACP_CLI_HARNESS_IDS.has(harness)
+    ACP_CLI_HARNESS_IDS.has(harness)
   );
 }
 

@@ -2659,7 +2659,15 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
-                    wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    labels = body.get("labels")
+                    wrapper_label = wrapper_label_from_labels(labels)
+                    if (
+                        isinstance(labels, dict)
+                        and session_id not in _session_acp_permission_modes
+                    ):
+                        acp_permission_label = labels.get("omnigent.acp.permission_mode")
+                        if acp_permission_label in ("auto", "bypassPermissions"):
+                            _session_acp_permission_modes[session_id] = acp_permission_label
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -8374,7 +8382,11 @@ def create_runner_app(
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
             canonical_harness = canonicalize_harness(harness) if harness else None
-            is_acp_harness = canonical_harness == "acp" or harness in ACP_CLI_HARNESSES
+            is_acp_harness = (
+                canonical_harness == "acp"
+                or canonical_harness in ACP_CLI_HARNESSES
+                or harness in ACP_CLI_HARNESSES
+            )
             if harness in ("claude-native", "devin-native") or is_acp_harness:
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):

@@ -31,7 +31,7 @@ export const BUILTIN_AGENTS = new Set([
 // doesn't report `capabilities.integration_mode`. NOT the source of truth — a
 // new builtin ACP row needs no entry here, because `useAvailableAgents` stamps
 // `acpHarness` from the server catalog (see {@link isAcpHarnessAgent}).
-export const LEGACY_ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok", "jcode", "mirror"]);
+export const LEGACY_ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok", "jcode"]);
 
 /**
  * Whether an agent is backed by the generic ACP harness — a user-configured

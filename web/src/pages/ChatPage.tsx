@@ -1738,6 +1738,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   subagentRoutingEligible,
   subAgentLabel,
   wrapperLabel,
+  acpHarnessIds,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
@@ -2063,6 +2064,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
+            acpHarnessIds={acpHarnessIds}
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
             runnerOnline={runnerOnline}
