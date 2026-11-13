@@ -8,6 +8,7 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -40,6 +41,7 @@ _CREATE_DEADLINE: ContextVar[tuple[float, float] | None] = ContextVar(
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
+_MULTI_REPO_MANIFEST = ".omnigent-worktrees.json"
 
 # Chars git refuses in a ref: space, control chars, ``~^:?*[\``, DEL.
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
@@ -354,7 +356,26 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
                 break
     while not search_path.is_dir() and search_path.parent != search_path:
         search_path = search_path.parent
-    repo_root = _main_work_tree(str(search_path))
+    try:
+        repo_root = _main_work_tree(str(search_path))
+    except WorktreeError as exc:
+        if str(exc) != f"not a git repository: {search_path}":
+            raise
+        if not for_cleanup:
+            search_path = search_path.resolve()
+        members = _workspace_members(search_path)
+        if members is None:
+            raise
+        branches = {tree.branch for _, tree in members}
+        return [
+            WorktreeInfo(
+                path=str(search_path),
+                branch=next(iter(branches)) if len(branches) == 1 else None,
+                is_main=False,
+                detached=any(tree.detached for _, tree in members),
+                updated_at=max((tree.updated_at or 0 for _, tree in members), default=0) or None,
+            )
+        ]
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
@@ -416,7 +437,9 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
-def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
+def _resolve_worktree_path(
+    repo_root: str, branch_name: str, *, workspace_manifest: bool = False
+) -> Path:
     """Compute a collision-free sibling worktree directory path.
 
     Places the worktree at
@@ -427,6 +450,7 @@ def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
         ``"/Users/alice/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
+    :param workspace_manifest: Also reserve the multi-repository metadata sidecar.
     :returns: A path that does not yet exist, e.g.
         ``Path("/Users/alice/myrepo-worktrees/feature-login")``.
     :raises WorktreeError: If no free path is found within
@@ -435,12 +459,11 @@ def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
     root = Path(repo_root)
     base_dir = root.parent / f"{root.name}-worktrees"
     dirname = _sanitize_dirname(branch_name)
-    candidate = base_dir / dirname
-    if not candidate.exists():
-        return candidate
-    for suffix in range(2, _MAX_DIR_COLLISION_SUFFIX + 1):
-        candidate = base_dir / f"{dirname}-{suffix}"
-        if not candidate.exists():
+    for suffix in range(1, _MAX_DIR_COLLISION_SUFFIX + 1):
+        candidate = base_dir / (dirname if suffix == 1 else f"{dirname}-{suffix}")
+        if not candidate.exists() and not (
+            workspace_manifest and os.path.lexists(_workspace_manifest(candidate))
+        ):
             return candidate
     raise WorktreeError(
         f"could not find a free worktree directory under {base_dir} "
@@ -517,6 +540,7 @@ def create_worktree(
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
+    For a plain folder, creates a worktree for each discovered direct-child repository.
     Resolves the repo root, picks a collision-free sibling directory,
     and runs ``git worktree add -b`` (fetching once if ``base_branch``
     isn't locally resolvable). With ``existing_branch`` the branch must
@@ -573,9 +597,11 @@ def _create_worktree(
     existing_branch: bool,
     deadline: float,
     budget_s: float,
+    destination: Path | None = None,
 ) -> CreatedWorktree:
     """Do :func:`create_worktree`'s work against its deadline.
 
+    :param destination: Explicit child placement for a multi-repository workspace.
     :param deadline: :func:`time.monotonic` value by which the create must return.
     :param budget_s: The whole budget, named in a timeout error.
     """
@@ -588,7 +614,38 @@ def _create_worktree(
     # worktree would nest under the picked worktree
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
     # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
-    repo_root = _main_work_tree(repo_path)
+    try:
+        repo_root = _main_work_tree(repo_path)
+    except WorktreeError as exc:
+        if destination is not None or str(exc) != f"not a git repository: {repo_path}":
+            raise
+        from omnigent.runtime.filesystem_registry import _is_git_repo
+
+        roots = {}
+        try:
+            # Match sibling discovery, without the Changes view's cache-name/count filters.
+            with os.scandir(repo_path) as entries:
+                for entry in entries:
+                    _time_left(deadline, budget_s)
+                    if entry.is_dir(follow_symlinks=False):
+                        root = Path(entry.path)
+                        if _is_git_repo(root):
+                            roots[entry.name] = root
+        except OSError as discovery_error:
+            raise WorktreeError(
+                f"repository discovery failed: {discovery_error}"
+            ) from discovery_error
+        if not roots:
+            raise
+        return _create_workspace_worktrees(
+            roots=roots,
+            repo_path=repo_path,
+            branch_name=branch_name,
+            base_branch=base_branch,
+            existing_branch=existing_branch,
+            deadline=deadline,
+            budget_s=budget_s,
+        )
     prefix = _run_git(["rev-parse", "--show-prefix"], cwd=repo_path)
     if prefix.returncode != 0:
         raise _git_error("could not resolve selected repository directory", prefix)
@@ -649,7 +706,7 @@ def _create_worktree(
                 f"selected path {relative_directory!r} is not a directory in {revision!r}; "
                 "choose another directory or base branch"
             )
-    worktree_path = _resolve_worktree_path(repo_root, branch_name)
+    worktree_path = destination or _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     if existing_branch:
@@ -707,6 +764,140 @@ def _create_worktree(
         branch=branch_name,
         workspace=str(worktree_path / relative_directory),
     )
+
+
+def _create_workspace_worktrees(
+    *,
+    roots: dict[str, Path],
+    repo_path: str,
+    branch_name: str,
+    base_branch: str | None,
+    existing_branch: bool,
+    deadline: float,
+    budget_s: float,
+) -> CreatedWorktree:
+    """Create sibling repositories as one session, rolling back failed requests."""
+    workspace = _resolve_worktree_path(
+        str(Path(repo_path).resolve()), branch_name, workspace_manifest=True
+    )
+    manifest = _workspace_manifest(workspace)
+    manifest_created = False
+    workspace_created = False
+    work_deadline = deadline - min(_GIT_TIMEOUT_S, budget_s * _ROLLBACK_RESERVE_FRACTION)
+    attempted: list[tuple[Path, Path, bool]] = []
+    repository = Path(repo_path)
+    try:
+        workspace.mkdir(parents=True)
+        workspace_created = True
+        # A sibling sidecar cannot overlap source files or any child repository name.
+        _CREATE_DEADLINE.set((work_deadline, budget_s))
+        sources = {}
+        for name, repository in sorted(roots.items()):
+            sources[name] = _main_work_tree(str(repository))
+        with manifest.open("x") as stream:
+            manifest_created = True
+            json.dump({"workspace": str(workspace), "repositories": sources}, stream)
+        for name, repository in sorted(roots.items()):
+            _CREATE_DEADLINE.set((work_deadline, budget_s))
+            branch_existed = _local_branch_exists(str(repository), branch_name)
+            destination = workspace / name
+            attempted.append((repository, destination, branch_existed))
+            _create_worktree(
+                repo_path=str(repository),
+                branch_name=branch_name,
+                base_branch=base_branch,
+                existing_branch=existing_branch,
+                deadline=work_deadline,
+                budget_s=budget_s,
+                destination=destination,
+            )
+    except (WorktreeError, OSError) as exc:
+        _CREATE_DEADLINE.set((deadline, budget_s))
+        rollback_errors = []
+        for source, destination, branch_existed in reversed(attempted):
+            try:
+                if destination.exists():
+                    remove_worktree(worktree_path=str(destination), deadline=deadline)
+                else:
+                    # Interrupted adds can leave a registration after removing their directory.
+                    registered = any(
+                        tree.path == str(destination) and not tree.is_main
+                        for tree in list_worktrees(repo_path=str(source))
+                    )
+                    if registered:
+                        result = _run_git(
+                            ["worktree", "remove", "--force", str(destination)],
+                            cwd=str(source),
+                            timeout=_rollback_timeout(deadline, None),
+                        )
+                        if result.returncode:
+                            raise _git_error("could not roll back worktree registration", result)
+                if not branch_existed and _local_branch_exists(str(source), branch_name):
+                    result = _run_git(["branch", "-D", branch_name], cwd=str(source))
+                    if result.returncode:
+                        raise _git_error("could not roll back branch", result)
+            except (WorktreeError, OSError) as rollback_error:
+                rollback_errors.append(f"{destination}: {rollback_error}")
+        try:
+            if not rollback_errors:
+                if workspace_created:
+                    workspace.rmdir()
+                if manifest_created:
+                    manifest.unlink()
+        except OSError as rollback_error:
+            rollback_errors.append(str(rollback_error))
+        detail = f"; rollback failed: {'; '.join(rollback_errors)}" if rollback_errors else ""
+        raise WorktreeError(f"repository {repository.name!r}: {exc}{detail}") from exc
+    return CreatedWorktree(str(workspace), branch_name, str(workspace))
+
+
+def _workspace_manifest(workspace: Path) -> Path:
+    """Keep session metadata beside, never inside, the selected workspace content."""
+    return workspace.parent / f".{workspace.name}{_MULTI_REPO_MANIFEST}"
+
+
+def _workspace_members(workspace: Path) -> list[tuple[str, WorktreeInfo]] | None:
+    """Validate every recorded child before exposing a workspace to cleanup."""
+    manifest = _workspace_manifest(workspace)
+    if not manifest.exists():
+        return None
+    if workspace.resolve() != workspace.absolute() or manifest.is_symlink():
+        raise WorktreeError(f"path is not the expected worktree root: {workspace}")
+    try:
+        metadata = json.loads(manifest.read_text())
+    except (OSError, ValueError) as exc:
+        raise WorktreeError(f"invalid worktree manifest: {workspace}") from exc
+    if not isinstance(metadata, dict) or metadata.get("workspace") != str(workspace):
+        raise WorktreeError(f"invalid worktree manifest: {workspace}")
+    roots = metadata.get("repositories")
+    if not isinstance(roots, dict) or not roots:
+        raise WorktreeError(f"invalid worktree manifest: {workspace}")
+    members = []
+    for name, source in roots.items():
+        if (
+            not isinstance(name, str)
+            or name in {"", ".", ".."}
+            or Path(name).name != name
+            or not isinstance(source, str)
+        ):
+            raise WorktreeError(f"invalid worktree manifest: {workspace}")
+        child = workspace / name
+        if child.is_symlink() or not child.is_dir():
+            raise WorktreeError(f"not a git worktree: {child}")
+        if _main_repo_for_worktree(str(child)) != source:
+            raise WorktreeError(f"repository changed for worktree: {child}")
+        tree = next(
+            (
+                tree
+                for tree in list_worktrees(repo_path=str(child))
+                if tree.path == str(child) and not tree.is_main
+            ),
+            None,
+        )
+        if tree is None:
+            raise WorktreeError(f"path is not the expected worktree root: {child}")
+        members.append((source, tree))
+    return members
 
 
 def _main_repo_for_worktree(worktree_path: str, *, timeout: float | None = None) -> str:
@@ -773,7 +964,29 @@ def remove_worktree(
         raise WorktreeError(f"worktree path does not exist: {worktree_path}")
     if not Path(worktree_path).is_dir():
         raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
-    main_repo = _main_repo_for_worktree(worktree_path, timeout=bound(_GIT_TIMEOUT_S))
+    try:
+        main_repo = _main_repo_for_worktree(worktree_path, timeout=bound(_GIT_TIMEOUT_S))
+    except WorktreeError as exc:
+        if str(exc) != f"not a git worktree: {worktree_path}":
+            raise
+        members = _workspace_members(Path(worktree_path))
+        if members is None:
+            raise
+        for _, tree in members:
+            remove_worktree(
+                worktree_path=tree.path,
+                branch=branch,
+                delete_branch=delete_branch,
+                deadline=deadline,
+            )
+        try:
+            _workspace_manifest(Path(worktree_path)).unlink()
+            # Preserve files the session may have created outside its repositories.
+            if not any(Path(worktree_path).iterdir()):
+                Path(worktree_path).rmdir()
+        except OSError as error:
+            raise WorktreeError(f"could not remove workspace metadata: {error}") from error
+        return
     root = _run_git(
         ["rev-parse", "--show-toplevel"], cwd=worktree_path, timeout=bound(_GIT_TIMEOUT_S)
     )
