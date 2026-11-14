@@ -8,6 +8,8 @@ root resolution, or removal ordering fails loud here.
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -356,8 +358,6 @@ def test_create_worktree_existing_branch_recreates_after_dir_deleted(git_repo: P
     (leaving a stale registration), then ``existing_branch=True`` prunes
     the stale entry and adds a fresh worktree for the same branch.
     """
-    import shutil
-
     created = create_worktree(repo_path=str(git_repo), branch_name="fix-1")
     shutil.rmtree(created.worktree_path)
     recreated = create_worktree(repo_path=str(git_repo), branch_name="fix-1", existing_branch=True)
@@ -1063,7 +1063,7 @@ def test_workspace_creation_rolls_back(
     assert not (first.parent.parent / "workspace-worktrees" / "feature-rollback").exists()
 
 
-@pytest.mark.parametrize("replacement", ["symlink", "main", "missing"])
+@pytest.mark.parametrize("replacement", ["symlink", "main", "directory"])
 def test_workspace_removal_validates_all_children(
     sibling_repositories: list[Path], replacement: str
 ) -> None:
@@ -1076,6 +1076,8 @@ def test_workspace_removal_validates_all_children(
         child.symlink_to(second, target_is_directory=True)
     elif replacement == "main":
         _git(root, "clone", "--no-local", str(second), str(child))
+    else:
+        child.mkdir()
     with pytest.raises(WorktreeError):
         remove_worktree(worktree_path=str(root), branch=created.branch, delete_branch=True)
     assert (root / first.name).is_dir()
@@ -1104,6 +1106,7 @@ def test_workspace_manifest_does_not_overlap_content(
     first, second = sibling_repositories
     workspace = first.parent
     name = git_worktree_module._MULTI_REPO_MANIFEST
+    content: Path | None = None
     if location in {"repository_name", "sidecar_name", "cache_name"}:
         if location == "sidecar_name":
             name = git_worktree_module._workspace_manifest(Path("feature-shared")).name
@@ -1125,7 +1128,7 @@ def test_workspace_manifest_does_not_overlap_content(
         assert (root / first.name / name).read_text() == "ordinary content"
     assert list_worktrees(repo_path=created.workspace)[0].branch == created.branch
     remove_worktree(worktree_path=created.worktree_path, branch=created.branch, delete_branch=True)
-    if location not in {"repository_name", "sidecar_name", "cache_name"}:
+    if content is not None:
         assert content.read_text() == "ordinary content"
     assert not git_worktree_module._workspace_manifest(root).exists()
 
@@ -1198,8 +1201,6 @@ def test_workspace_rollback_reports_cleanup_failure(
 def test_workspace_timeout_after_git_add_rolls_back(
     sibling_repositories: list[Path], monkeypatch: pytest.MonkeyPatch, missing_directory: bool
 ) -> None:
-    import shutil
-
     first, second = sibling_repositories
     original = git_worktree_module._exec_git
 
@@ -1243,3 +1244,159 @@ def test_workspace_discovery_ignores_invalid_git_marker(tmp_path: Path) -> None:
     (tmp_path / "ordinary" / ".git").mkdir(parents=True)
     with pytest.raises(WorktreeError, match=f"not a git repository: {tmp_path}"):
         create_worktree(repo_path=str(tmp_path), branch_name="feature/shared")
+
+
+@pytest.mark.parametrize("fault", ["locked", "missing", "unregistered", "branch_delete"])
+def test_review_group_cleanup_retry(
+    sibling_repositories: list[Path], monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    first, second = sibling_repositories
+    created = create_worktree(repo_path=str(first.parent), branch_name="feature/retry")
+    root = Path(created.workspace)
+    if fault == "locked":
+        _git(second, "worktree", "lock", str(root / second.name))
+    elif fault == "missing":
+        shutil.rmtree(root / first.name)
+    elif fault == "unregistered":
+        remove_worktree(worktree_path=str(root / first.name))
+    original = git_worktree_module._exec_git
+
+    def fail_branch(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["branch", "-D"] and kwargs["cwd"] == str(second):
+            return subprocess.CompletedProcess(args, 1, "", "injected branch deletion failure")
+        return original(args, **kwargs)
+
+    if fault == "branch_delete":
+        monkeypatch.setattr(git_worktree_module, "_exec_git", fail_branch)
+    if fault not in {"missing", "unregistered"}:
+        with pytest.raises(WorktreeError):
+            remove_worktree(worktree_path=str(root), branch=created.branch, delete_branch=True)
+        assert not (root / first.name).exists()
+    if fault == "locked":
+        _git(second, "worktree", "unlock", str(root / second.name))
+    monkeypatch.setattr(git_worktree_module, "_exec_git", original)
+    assert list_worktrees(repo_path=str(root), for_cleanup=True)[0].branch == created.branch
+    remove_worktree(worktree_path=str(root), branch=created.branch, delete_branch=True)
+    assert not root.exists()
+    assert not git_worktree_module._workspace_manifest(root).exists()
+    for repo in sibling_repositories:
+        assert _worktree_count(repo) == 1
+        assert not _branch_exists(repo, created.branch)
+
+
+@pytest.mark.parametrize("layout", ["bare", "separate"])
+def test_review_nonstandard_git_directory(git_repo: Path, layout: str) -> None:
+    workspace = git_repo.parent / "workspace"
+    workspace.mkdir()
+    child = workspace / "child"
+    store = git_repo.parent / "store.git"
+    if layout == "bare":
+        _git(git_repo.parent, "clone", "--bare", str(git_repo), str(store))
+        _git(store, "worktree", "add", str(child), "main")
+    else:
+        _git(git_repo.parent, "clone", "--separate-git-dir", str(store), str(git_repo), str(child))
+    created = create_worktree(repo_path=str(workspace), branch_name="feature/layout")
+    assert list_worktrees(repo_path=created.workspace)[0].branch == created.branch
+    remove_worktree(worktree_path=created.worktree_path, branch=created.branch, delete_branch=True)
+    assert not Path(created.workspace).exists()
+    assert not _branch_exists(child, created.branch)
+
+
+def test_review_rollback_preserves_racing_branch(
+    sibling_repositories: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = sibling_repositories
+    branch = "feature/race"
+    original = git_worktree_module._exec_git
+    racing_commit = ""
+
+    def race(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal racing_commit
+        if args[:2] == ["worktree", "add"] and kwargs["cwd"] == str(second):
+            _git(second, "checkout", "-b", branch)
+            (second / "concurrent.txt").write_text("another process owns this")
+            _git(second, "add", ".")
+            _git(second, "commit", "-qm", "concurrent commit")
+            racing_commit = _rev_parse(second)
+            _git(second, "checkout", "main")
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(git_worktree_module, "_exec_git", race)
+    with pytest.raises(WorktreeError, match="repository 'second':"):
+        create_worktree(repo_path=str(first.parent), branch_name=branch)
+    assert _branch_exists(second, branch)
+    assert _rev_parse(second, branch) == racing_commit
+    assert not _branch_exists(first, branch)
+    assert _worktree_count(first) == _worktree_count(second) == 1
+    root = first.parent.parent / "workspace-worktrees" / "feature-race"
+    assert not root.exists()
+    assert not git_worktree_module._workspace_manifest(root).exists()
+
+
+def test_review_manifest_cannot_enroll_foreign_repository(
+    sibling_repositories: list[Path],
+) -> None:
+    first, second = sibling_repositories
+    created = create_worktree(repo_path=str(first.parent), branch_name="feature/membership")
+    root = Path(created.workspace)
+    foreign = first.parent.parent / "foreign"
+    _git(first.parent.parent, "clone", str(first), str(foreign))
+    _git(foreign, "worktree", "add", "-b", created.branch, str(root / "foreign"))
+    manifest = git_worktree_module._workspace_manifest(root)
+    metadata = json.loads(manifest.read_text())
+    metadata["repositories"]["foreign"] = str(foreign)
+    manifest.write_text(json.dumps(metadata))
+    with pytest.raises(WorktreeError, match=r"manifest|membership"):
+        remove_worktree(worktree_path=str(root), branch=created.branch, delete_branch=True)
+    assert _branch_exists(foreign, created.branch)
+    assert _worktree_count(foreign) == 2
+    assert _worktree_count(first) == _worktree_count(second) == 2
+
+
+@pytest.mark.parametrize("fault", ["mkdir", "manifest"])
+def test_review_workspace_errors_do_not_name_a_repository(
+    sibling_repositories: list[Path], monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    first, _ = sibling_repositories
+    original_mkdir = Path.mkdir
+    original_open = Path.open
+
+    def fail_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name == "feature-errors":
+            raise PermissionError("injected workspace mkdir failure")
+        original_mkdir(path, *args, **kwargs)
+
+    def fail_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path.name == ".feature-errors.omnigent-worktrees.json":
+            raise PermissionError("injected manifest write failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Path,
+        "mkdir" if fault == "mkdir" else "open",
+        fail_mkdir if fault == "mkdir" else fail_open,
+    )
+    with pytest.raises(WorktreeError) as caught:
+        create_worktree(repo_path=str(first.parent), branch_name="feature/errors")
+    assert "repository '" not in str(caught.value)
+    assert "injected" in str(caught.value)
+
+
+def test_review_unreadable_workspace_keeps_original_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_scan(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("injected scan failure")
+
+    monkeypatch.setattr(git_worktree_module.os, "scandir", fail_scan)
+    with pytest.raises(WorktreeError) as caught:
+        create_worktree(repo_path=str(tmp_path), branch_name="feature/scan")
+    assert str(caught.value) == f"not a git repository: {tmp_path}"
+
+
+def test_review_duplicate_repository_has_specific_error(sibling_repositories: list[Path]) -> None:
+    first, _ = sibling_repositories
+    _git(first, "worktree", "add", "-b", "linked", str(first.parent / "third"))
+    with pytest.raises(WorktreeError, match="same repository"):
+        create_worktree(repo_path=str(first.parent), branch_name="feature/duplicate")
+    assert not _branch_exists(first, "feature/duplicate")
