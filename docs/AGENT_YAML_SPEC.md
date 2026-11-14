@@ -984,6 +984,20 @@ tools:
       Authorization: Bearer ${TOKEN}
 ```
 
+Remote HTTP MCP servers can also resolve a short-lived bearer token at connect
+and request time with `auth_command`. The command runs with
+`OMNIGENT_MCP_SERVER_NAME` and (when scoped to a user) `OMNIGENT_MCP_USER_ID`
+in its environment, and its trimmed `stdout` is sent as
+`Authorization: Bearer <token>`:
+
+```yaml
+tools:
+  docs:
+    type: mcp
+    url: https://example.com/mcp
+    auth_command: my-token-helper --server "$OMNIGENT_MCP_SERVER_NAME"
+```
+
 ### Python function tool
 
 ```yaml
@@ -1138,7 +1152,7 @@ byte-bounded provider counts every advertised tool against its limit.
 ```yaml
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete, sys_reminder_set
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
