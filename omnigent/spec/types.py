@@ -417,6 +417,7 @@ class ApiKeyAuth:
     :param base_url: Optional OpenAI-compatible endpoint URL,
         e.g. ``"https://my-gateway.example.com/v1"``. When omitted,
         the default ``https://api.openai.com/v1`` is used.
+    :param source_env_names: Credential environment names retained before expansion.
     """
 
     # Required: the resolved API key value (env-var refs expanded at parse time).
@@ -424,6 +425,8 @@ class ApiKeyAuth:
     # Optional: custom endpoint; None means use the default OpenAI endpoint.
     base_url: str | None = None
     type: Literal["api_key"] = "api_key"
+    # Original credential env refs survive expansion for child-process scrubbing.
+    source_env_names: tuple[str, ...] = field(default=(), repr=False, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -875,24 +878,37 @@ class ToolsConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
+# The tools behind ``ToolGroupsConfig.memory``. The runner routes calls with
+# these names to the memory server only for an agent whose memory group is on.
+MEMORY_TOOL_NAMES: frozenset[str] = frozenset(
+    {"memory_search", "memory_get", "memory_list", "memory_write", "memory_delete"}
+)
+
+
 @dataclass
 class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: the groups register on every agent
-    unless the spec opts out under a top-level ``tool_groups:`` block (a
-    mapping of group name to boolean). Trimming a group the agent cannot
-    use keeps the advertised tool payload under a strict provider's byte
-    limit and stops a small model from picking an irrelevant tool.
+    Every group defaults to ``True``: groups register on every agent unless
+    the spec opts out under a top-level ``tool_groups:`` block (a mapping of
+    group name to boolean). Trimming a group the agent cannot use keeps the
+    advertised tool payload under a strict provider's byte limit and stops a
+    small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
-    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4).
+    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
+        statuses and notes.
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
+    :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+        which write to and read the owner's Inbox. The runner also drops them
+        unless the server offers the Inbox to the session's owner.
+    :param memory: The ``memory_*`` long-term memory tools (5).
     """
 
     browser: bool = True
@@ -900,7 +916,10 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    journal: bool = True
     projects: bool = True
+    user_inbox: bool = True
+    memory: bool = True
 
 
 @dataclass
@@ -1010,6 +1029,10 @@ class MCPServerConfig:
         initialization and tool calls.
     :param retry: Per-tool retry policy. ``None`` inherits
         ``tools.retry``.
+    :param auth_command: Optional shell command executed at connect
+        and request time via ``/bin/sh -c`` whose trimmed stdout is
+        sent as ``Authorization: Bearer <token>``. Valid only on
+        ``"http"``.
     """
 
     name: str
@@ -1037,23 +1060,27 @@ class MCPServerConfig:
     # tools.timeout / tools.retry.
     timeout: int | None = None
     retry: RetryPolicy | None = None
+    # Dynamic HTTP credential command invoked at connect/request time.
+    auth_command: str | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         """
         String representation that redacts secret-bearing fields.
 
-        Header and env values are replaced with ``"[REDACTED]"`` —
-        credentials commonly travel through these fields and we
-        don't want them in exception tracebacks / log scrapes.
-        Keys are preserved so operators can still tell which
+        Header, env, and auth_command values are replaced with
+        ``"[REDACTED]"`` — credentials commonly travel through these
+        fields and we don't want them in exception tracebacks / log
+        scrapes. Keys are preserved so operators can still tell which
         secrets were attached.
         """
         redacted_headers = dict.fromkeys(self.headers, "[REDACTED]") if self.headers else {}
         redacted_env = dict.fromkeys(self.env, "[REDACTED]") if self.env else {}
+        redacted_auth_command = "[REDACTED]" if self.auth_command else None
         return (
             f"MCPServerConfig(name={self.name!r}, transport={self.transport!r}, "
             f"url={self.url!r}, headers={redacted_headers!r}, "
             f"databricks_profile={self.databricks_profile!r}, "
+            f"auth_command={redacted_auth_command!r}, "
             f"command={self.command!r}, args={self.args!r}, "
             f"env={redacted_env!r}, "
             f"timeout={self.timeout!r}, retry={self.retry!r})"
@@ -1594,6 +1621,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         an absent block changes nothing; a spec sets a group to
         ``false`` to drop tools it cannot use from the advertised
         payload. See :class:`ToolGroupsConfig` for the groups.
+    :param memory_search_available: Whether the server's memory backend can
+        search, so ``memory_search`` is offered with the other memory tools.
+        Set by the runner from the bundle download, never from YAML.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1656,6 +1686,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
+    # Not read from YAML: the runner clears it when the server's memory backend
+    # has no search, which drops ``memory_search`` from the memory tools.
+    memory_search_available: bool = True
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
 
