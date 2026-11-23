@@ -34,6 +34,9 @@ Env vars read at startup:
   ``caller_process + sandbox=none``.
 - ``HARNESS_COPILOT_SKILLS_FILTER``: JSON ``str | list[str]`` (parity;
   copilot has no skill mechanism wired here). Defaults to ``"all"``.
+- ``HARNESS_COPILOT_PERMISSION_MODE``: Omnigent permission stance for native
+  tools: ``"default"`` (prompt via elicitation card) or ``"bypassPermissions"``
+  (approve non-ASK verdicts without prompting while enforcing policy denials).
 - ``HARNESS_COPILOT_BUNDLE_DIR`` / ``HARNESS_COPILOT_AGENT_NAME``:
   reserved for future use.
 """
@@ -48,9 +51,9 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from omnigent.inner.copilot_executor import CopilotExecutor
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -63,42 +66,13 @@ _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_COPILOT_AGENT_NAME"
+_ENV_PERMISSION_MODE = "HARNESS_COPILOT_PERMISSION_MODE"
+_DEFAULT_PERMISSION_MODE = "default"
 
 
 def _resolve_os_env() -> OSEnvSpec:
-    """Resolve the inner-executor :class:`OSEnvSpec` from :data:`_ENV_OS_ENV`.
-
-    Decodes the JSON-encoded dict Omnigent serialized via
-    :func:`dataclasses.asdict`. When the env var is missing or malformed, falls
-    back to ``caller_process + sandbox=none`` — matches the cursor/codex/pi
-    wraps' default for specs without an ``os_env:`` block.
-    """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            _logger.warning(
-                "%s is not valid JSON (%s); falling back to default os_env", _ENV_OS_ENV, exc
-            )
-            payload = None
-        if isinstance(payload, dict):
-            sandbox_payload = payload.get("sandbox")
-            sandbox = (
-                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
-            )
-            return OSEnvSpec(
-                type=str(payload.get("type", "caller_process")),
-                cwd=payload.get("cwd"),
-                sandbox=sandbox,
-                fork=bool(payload.get("fork", False)),
-            )
-    return OSEnvSpec(
-        type="caller_process",
-        cwd=None,
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
+    """Decode the supplied policy without downgrading malformed configuration."""
+    return resolve_harness_os_env(_ENV_OS_ENV)
 
 
 def _resolve_skills_filter() -> str | list[str]:
@@ -143,6 +117,9 @@ def _build_copilot_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),
+        permission_mode=(
+            os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
+        ),
     )
 
 
